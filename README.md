@@ -40,7 +40,7 @@ outputs[0]["text"]
 See `bench.py` for benchmark.
 
 **Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
+- Hardware: RTX 4090 (24GB)
 - Model: Qwen3-0.6B
 - Total Requests: 256 sequences
 - Input Length: Randomly sampled between 100–1024 tokens
@@ -49,10 +49,5 @@ See `bench.py` for benchmark.
 **Performance Results:**
 | Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
 |----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
-
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+| enable_chunked_prefill=False    | 133,966     | 25.90    | 5173.29              |
+| enable_chunked_prefill=True     | 133,966     | 155.71   | 860.34               |

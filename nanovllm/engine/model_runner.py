@@ -133,6 +133,7 @@ class ModelRunner:
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
+            assert seq.num_cached_tokens < seq.num_prompt_tokens
             # Handle chunked prefill: only process specified number of tokens
             if seq.num_tokens_to_process is not None:
                 tokens_to_process = min(seq.num_tokens_to_process, seqlen - seq.num_cached_tokens)
@@ -174,6 +175,7 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         for seq in seqs:
+            assert seq.num_cached_tokens >= seq.num_prompt_tokens
             input_ids.append(seq.last_token)
             positions.append(len(seq))
             context_lens.append(len(seq))
