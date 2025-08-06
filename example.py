@@ -6,19 +6,24 @@ from transformers import AutoTokenizer
 def main():
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
     tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
+    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1, enable_chunked_prefill=True)
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
         "introduce yourself",
         "list all prime numbers within 100",
     ]
+    # prompts = [
+    #     "introduce yourself",
+    #     "list all prime numbers within 100",
+    #     "This is a very long prompt that will definitely need chunked prefill. " * 50 + "Please provide a comprehensive analysis of artificial intelligence."
+    # ]
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=True
+            enable_thinking=False
         )
         for prompt in prompts
     ]
