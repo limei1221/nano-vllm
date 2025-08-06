@@ -14,6 +14,9 @@ def main():
         "list all prime numbers within 100",
         "This is a very long prompt that will definitely need chunked prefill. " * 70 + "Please provide a comprehensive analysis of artificial intelligence.",  # len(tokens) = 1071
     ]
+    # prompts = [
+    #     "This is a very long prompt that will definitely need chunked prefill. " * 70 + "Please provide a comprehensive analysis of artificial intelligence." for _ in range(3)
+    # ]
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],

@@ -47,7 +47,7 @@ See `bench.py` for benchmark.
 - Output Length: Randomly sampled between 100–1024 tokens
 
 **Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
+|  | Output Tokens | Time (s) | Throughput (tokens/s) |
 |----------------|-------------|----------|-----------------------|
-| enable_chunked_prefill=False    | 133,966     | 25.90    | 5173.29              |
-| enable_chunked_prefill=True     | 133,966     | 155.71   | 860.34               |
+| enable_chunked_prefill=False    | 133,966     | 25.85    | 5181.72              |
+| enable_chunked_prefill=True     | 133,966     | 25.01    | 5356.15              |

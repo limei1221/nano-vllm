@@ -44,7 +44,7 @@ class Scheduler:
             self.waiting.popleft()
             self.running.append(seq)
             scheduled_seqs.append(seq)
-            seq.num_tokens_to_process = len(seq)
+            seq.num_tokens_to_process = seq.num_prompt_tokens
         if scheduled_seqs:
             return scheduled_seqs, True
 
@@ -66,31 +66,12 @@ class Scheduler:
         return scheduled_seqs, False
 
     def _chunked_prefill_schedule(self) -> tuple[list[Sequence], bool]:
-        scheduled_seqs = []
         token_budget = self.max_num_batched_tokens
-
-        num_seqs = 0
-        # decode
-        while self.running and num_seqs < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
-                    break
-            else:
-                if token_budget >= 1:
-                    num_seqs += 1
-                    self.block_manager.may_append(seq)
-                    scheduled_seqs.append(seq)
-                    token_budget -= 1
-        if scheduled_seqs:
-            self.running.extendleft(reversed(scheduled_seqs))
-            return scheduled_seqs, False
 
         # prefill
         temp_waiting = deque()
+        scheduled_seqs = []
+        num_seqs = 0
         while self.waiting and token_budget > 0 and num_seqs < self.max_num_seqs:
             seq = self.waiting.popleft()
 
@@ -98,8 +79,8 @@ class Scheduler:
                 temp_waiting.append(seq)
                 continue
 
-            prompt_tokens_left = len(seq) - seq.num_cached_tokens
-
+            prompt_tokens_left = seq.num_prompt_tokens - seq.num_cached_tokens
+            assert prompt_tokens_left > 0
             if prompt_tokens_left <= token_budget:
                 if not seq.block_table:
                     self.block_manager.allocate(seq)
@@ -112,7 +93,6 @@ class Scheduler:
             else:
                 # Chunk the prompt
                 chunk_size = token_budget
-
                 if not seq.block_table:
                     self.block_manager.allocate(seq)
                 seq.status = SequenceStatus.RUNNING
@@ -122,10 +102,29 @@ class Scheduler:
                 token_budget = 0
 
         if temp_waiting:
-            self.waiting.extendleft(reversed(temp_waiting))
+            # self.waiting.extendleft(reversed(temp_waiting))
+            self.waiting.extend(temp_waiting)
 
         if scheduled_seqs:
             return scheduled_seqs, True
+
+        # decode
+        while self.running and token_budget >= 1 and num_seqs < self.max_num_seqs:
+            seq = self.running.popleft()
+            while not self.block_manager.can_append(seq):
+                if self.running:
+                    self.preempt(self.running.pop())
+                else:
+                    self.preempt(seq)
+                    break
+            else:
+                num_seqs += 1
+                self.block_manager.may_append(seq)
+                scheduled_seqs.append(seq)
+                token_budget -= 1
+        if scheduled_seqs:
+            self.running.extendleft(reversed(scheduled_seqs))
+            return scheduled_seqs, False
 
         return self._default_schedule()
 
@@ -149,6 +148,10 @@ class Scheduler:
                         self.running.append(seq)
 
                     seq.append_token(token_id)
+                    if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                        seq.status = SequenceStatus.FINISHED
+                        self.block_manager.deallocate(seq)
+                        self.running.remove(seq)
                 else:
                     # Still in prefill phase, keep in waiting for next chunk
                     seq.status = SequenceStatus.WAITING
@@ -159,7 +162,7 @@ class Scheduler:
             else:
                 # Normal decode phase
                 seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    self.running.remove(seq)
