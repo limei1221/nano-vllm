@@ -20,8 +20,8 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         self.ps = []
         self.events = []
-        ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
+        ctx = mp.get_context("spawn")  # each GPU initialize its own ModelRunner
+        for i in range(1, config.tensor_parallel_size):  # Loops through ranks 1 to N-1 (rank 0 is handled separately)
             event = ctx.Event()
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
@@ -37,7 +37,7 @@ class LLMEngine:
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
-            p.join()
+            p.join()  # wait for each child process to finish
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):

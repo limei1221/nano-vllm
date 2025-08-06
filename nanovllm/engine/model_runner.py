@@ -18,7 +18,7 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager
+        self.enforce_eager = config.enforce_eager  # use eager mode instead of cudagraphs
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -65,7 +65,7 @@ class ModelRunner:
             if method_name == "exit":
                 break
 
-    def read_shm(self):
+    def read_shm(self):  # for rank > 0
         assert self.world_size > 1 and self.rank
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
@@ -73,7 +73,7 @@ class ModelRunner:
         self.event.clear()
         return method_name, args
 
-    def write_shm(self, method_name, *args):
+    def write_shm(self, method_name, *args):  # for rank = 0
         assert self.world_size > 1 and not self.rank
         data = pickle.dumps([method_name, *args])
         n = len(data)
@@ -133,11 +133,19 @@ class ModelRunner:
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            seqlen_q = seqlen - seq.num_cached_tokens
-            seqlen_k = seqlen
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            # Handle chunked prefill: only process specified number of tokens
+            if seq.num_tokens_to_process is not None:
+                tokens_to_process = min(seq.num_tokens_to_process, seqlen - seq.num_cached_tokens)
+                input_ids.extend(seq[seq.num_cached_tokens:seq.num_cached_tokens + tokens_to_process])
+                positions.extend(list(range(seq.num_cached_tokens, seq.num_cached_tokens + tokens_to_process)))
+                seqlen_q = tokens_to_process
+                seqlen_k = seq.num_cached_tokens + tokens_to_process
+            else:
+                input_ids.extend(seq[seq.num_cached_tokens:])
+                positions.extend(list(range(seq.num_cached_tokens, seqlen)))
+                seqlen_q = seqlen - seq.num_cached_tokens
+                seqlen_k = seqlen
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)  # cumulative sequence lengths
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)

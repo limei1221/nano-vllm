@@ -27,6 +27,7 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.num_tokens_to_process = None  # For chunked prefill
 
     def __len__(self):
         return self.num_tokens
@@ -41,6 +42,11 @@ class Sequence:
     @property
     def num_completion_tokens(self):
         return self.num_tokens - self.num_prompt_tokens
+
+    @property
+    def is_prompt(self):
+        """Check if the sequence is still processing the initial prompt."""
+        return self.num_cached_tokens < self.num_prompt_tokens
 
     @property
     def prompt_token_ids(self):
@@ -73,11 +79,19 @@ class Sequence:
 
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+                self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+                self.num_tokens_to_process)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
-        if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
+        if len(state) == 6:
+            # New format with num_tokens_to_process
+            self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data, self.num_tokens_to_process = state
         else:
-            self.last_token = state[-1]
+            # Old format without num_tokens_to_process
+            self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data = state
+            self.num_tokens_to_process = None
+
+        if self.num_completion_tokens == 0:
+            self.token_ids = token_data
+        else:
+            self.last_token = token_data
