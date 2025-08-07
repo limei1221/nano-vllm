@@ -44,7 +44,7 @@ class Scheduler:
             self.waiting.popleft()
             self.running.append(seq)
             scheduled_seqs.append(seq)
-            seq.num_tokens_to_process = seq.num_prompt_tokens
+            seq.num_tokens_to_process = len(seq) - seq.num_cached_tokens
         if scheduled_seqs:
             return scheduled_seqs, True
 
@@ -79,7 +79,7 @@ class Scheduler:
                 temp_waiting.append(seq)
                 continue
 
-            prompt_tokens_left = seq.num_prompt_tokens - seq.num_cached_tokens
+            prompt_tokens_left = len(seq) - seq.num_cached_tokens
             assert prompt_tokens_left > 0
             if prompt_tokens_left <= token_budget:
                 if not seq.block_table:
@@ -100,10 +100,10 @@ class Scheduler:
                 num_seqs += 1
                 seq.num_tokens_to_process = chunk_size
                 token_budget = 0
+                # temp_waiting.append(seq)
 
         if temp_waiting:
-            # self.waiting.extendleft(reversed(temp_waiting))
-            self.waiting.extend(temp_waiting)
+            self.waiting.extendleft(reversed(temp_waiting))
 
         if scheduled_seqs:
             return scheduled_seqs, True
@@ -122,11 +122,9 @@ class Scheduler:
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
                 token_budget -= 1
-        if scheduled_seqs:
-            self.running.extendleft(reversed(scheduled_seqs))
-            return scheduled_seqs, False
-
-        return self._default_schedule()
+        assert scheduled_seqs
+        self.running.extendleft(reversed(scheduled_seqs))
+        return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING

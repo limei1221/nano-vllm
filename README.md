@@ -49,5 +49,5 @@ See `bench.py` for benchmark.
 **Performance Results:**
 |  | Output Tokens | Time (s) | Throughput (tokens/s) |
 |----------------|-------------|----------|-----------------------|
-| enable_chunked_prefill=False    | 133,966     | 25.85    | 5181.72              |
-| enable_chunked_prefill=True     | 133,966     | 25.01    | 5356.15              |
+| enable_chunked_prefill=False    | 133,966     | 25.97    | 5159.43              |
+| enable_chunked_prefill=True     | 133,966     | 25.08    | 5340.85              |
