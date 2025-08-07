@@ -17,6 +17,8 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     enable_chunked_prefill: bool = False
+    speculative_model: str | None = None
+    num_speculative_tokens: int = 0
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

@@ -10,6 +10,8 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.engine.speculative_decoder import SpeculativeDecoder
+from nanovllm.sampling_params import SamplingParams
 
 
 class ModelRunner:
@@ -31,6 +33,14 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+
+        self.speculative_decoder = None
+        if config.speculative_model and config.num_speculative_tokens > 0:
+            self.speculative_decoder = SpeculativeDecoder(
+                config.speculative_model,
+                config.num_speculative_tokens
+            )
+
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -134,6 +144,7 @@ class ModelRunner:
         for seq in seqs:
             seqlen = len(seq)
             assert seq.num_cached_tokens < seq.num_prompt_tokens
+            # assert seq.num_tokens - seq.num_cached_tokens > 1
             # Handle chunked prefill: only process specified number of tokens
             if seq.num_tokens_to_process is not None:
                 tokens_to_process = min(seq.num_tokens_to_process, seqlen - seq.num_cached_tokens)
@@ -176,6 +187,7 @@ class ModelRunner:
         context_lens = []
         for seq in seqs:
             assert seq.num_cached_tokens >= seq.num_prompt_tokens
+            # assert seq.num_tokens - seq.num_cached_tokens == 1
             input_ids.append(seq.last_token)
             positions.append(len(seq))
             context_lens.append(len(seq))
@@ -216,12 +228,90 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # Handle speculative decoding for decode phase
+        if not is_prefill and self.speculative_decoder and self.rank == 0:
+            return self.run_speculative_decode(seqs)
+
+        # Original non-speculative path
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    def run_speculative_decode(self, seqs: list[Sequence]) -> list[int]:
+        """
+        Run speculative decoding for the given sequences.
+        """
+        # Generate draft outputs
+        sequences = [seq.token_ids for seq in seqs]
+        temperatures = [seq.temperature for seq in seqs]
+        draft_tokens, draft_probs = self.speculative_decoder.generate_draft_tokens(
+            sequences, temperatures
+        )
+
+        # Create speculative sequences
+        speculative_seqs = []
+        for i, seq in enumerate(seqs):
+            seq.set_draft_tokens(draft_tokens[i], draft_probs[i])
+            assert len(seq.draft_tokens) == len(seq.draft_probs) == self.config.num_speculative_tokens
+
+            sampling_params = SamplingParams(
+                temperature=seq.temperature,
+                max_tokens=seq.max_tokens,
+                ignore_eos=seq.ignore_eos
+            )
+            speculative_seq = Sequence(seq.token_ids + seq.draft_tokens, sampling_params)
+            speculative_seq.block_table = seq.block_table.copy()
+            speculative_seq.num_cached_tokens = seq.num_cached_tokens
+            assert seq.num_cached_tokens == len(seq.token_ids) - 1
+            speculative_seq.num_tokens_to_process = speculative_seq.num_tokens - speculative_seq.num_cached_tokens
+            speculative_seq.draft_tokens = seq.draft_tokens
+            speculative_seq.draft_probs = seq.draft_probs
+            speculative_seq.is_speculative = True
+            speculative_seqs.append(speculative_seq)
+
+        # Target model single forward pass
+        input_ids, positions = self.prepare_prefill(speculative_seqs)
+        temperatures = self.prepare_sample(speculative_seqs)
+        logits = self.run_model(input_ids, positions, True)  # [num_seqs, len(seq.token_ids) + len(seq.draft_tokens), vocab_size]
+        assert logits.size(0) == len(speculative_seqs)
+
+        # Speculative sampling
+        final_token_ids = []
+        for i, seq in enumerate(seqs):
+            target_logits = logits[i, len(seq.token_ids) - 1 : -1]
+            target_probs = self.sampler(target_logits, temperatures)
+            accepted_tokens = []
+            for draft_token in seq.draft_tokens:
+                draft_prob = seq.draft_probs[draft_token]
+                target_prob = target_probs[draft_token]
+                accept_prob = torch.min(torch.ones_like(target_prob), target_prob / draft_prob)
+                if torch.rand(1, device=self.device) < accept_prob:
+                   accepted_tokens.append(draft_token)
+                else:
+                    break
+
+            num_accepted = len(accepted_tokens)
+            if num_accepted < self.config.num_speculative_tokens:
+                seq.append_speculative_tokens(accepted_tokens[i])
+                # TODO: update seq.block_table
+                del speculative_seqs[i]
+
+                adjusted_probs = torch.clamp(target_probs[:, num_accepted] - draft_probs[num_accepted], min=0)
+                adjusted_probs /= adjusted_probs.sum(dim=-1, keepdim=True)
+                next_token = torch.multinomial(adjusted_probs, num_samples=1)
+            else:
+                next_token = torch.multinomial(target_probs[:, -1], num_samples=1)
+
+            seq.append_token(next_token)
+            final_token_ids.append(next_token)
+
+            seq.clear_draft_tokens()
+
+        reset_context()
+        return final_token_ids
 
     @torch.inference_mode()
     def capture_cudagraph(self):
