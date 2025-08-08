@@ -17,7 +17,7 @@ def main():
         num_speculative_tokens=5,
     )
 
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=128)
+    sampling_params = SamplingParams(temperature=0.2, max_tokens=128)
     prompts = [
         "introduce yourself",
     ]
@@ -37,8 +37,9 @@ def main():
 
     for prompt, output in zip(prompts, outputs):
         print("\n")
-        # print(f"Prompt: {prompt!r}")
+        print(f"Prompt: {prompt!r}")
         print(f"Completion: {output['text']!r}")
+        print(f"Accept rate: {output['accept_rate']:.2f}")
 
 
 if __name__ == "__main__":

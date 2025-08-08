@@ -49,7 +49,13 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = []
+        for seq in seqs:
+            if seq.is_finished:
+                proposed = getattr(seq, "num_speculative_proposed_total", 0)
+                accepted = getattr(seq, "num_speculative_accepted_total", 0)
+                accept_rate = (accepted / proposed) if proposed > 0 else None
+                outputs.append((seq.seq_id, seq.completion_token_ids, accept_rate))
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
 
@@ -82,15 +88,17 @@ class LLMEngine:
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for item in output:
+                seq_id, token_ids, accept_rate = item
+                outputs[seq_id] = {"token_ids": token_ids, "accept_rate": accept_rate}
                 if use_tqdm:
                     pbar.update(1)
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
+        ordered = [outputs[seq_id] for seq_id in sorted(outputs)]
         outputs = [{
-            "text": self.tokenizer.decode(token_ids, skip_special_tokens=True),
-            "token_ids": token_ids,
-        } for token_ids in outputs]
+            "text": self.tokenizer.decode(item["token_ids"], skip_special_tokens=True),
+            "token_ids": item["token_ids"],
+            "accept_rate": item["accept_rate"],
+        } for item in ordered]
         if use_tqdm:
             pbar.close()
         return outputs

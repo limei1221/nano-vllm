@@ -289,6 +289,7 @@ class ModelRunner:
             seq_target_probs = seq_probs[-len(seq.draft_tokens) - 1: -1]
             assert seq.draft_probs.shape == seq_target_probs.shape
             accepted_tokens = []
+            seq.num_speculative_proposed_total += len(seq.draft_tokens)
             for token_idx, draft_token in enumerate(seq.draft_tokens):
                 draft_prob = seq.draft_probs[token_idx][draft_token]
                 target_prob = seq_target_probs[token_idx][draft_token]
@@ -297,8 +298,14 @@ class ModelRunner:
                    accepted_tokens.append(draft_token)
                 else:
                     break
+                # target_token = torch.argmax(seq_target_probs[token_idx]).item()
+                # if target_token == draft_token:
+                #     accepted_tokens.append(draft_token)
+                # else:
+                #     break
 
             num_accepted = len(accepted_tokens)
+            seq.num_speculative_accepted_total += num_accepted
             seq.pending_accepted_tokens = list(accepted_tokens)
             if num_accepted < len(seq.draft_tokens):
                 adjusted_probs = torch.clamp(
@@ -308,8 +315,10 @@ class ModelRunner:
                 adjusted_sum = adjusted_probs.sum()
                 adjusted_probs = adjusted_probs / adjusted_sum
                 next_token = torch.multinomial(adjusted_probs, num_samples=1).item()
+                # next_token = torch.argmax(seq_target_probs[num_accepted]).item()
             else:
                 next_token = torch.multinomial(seq_probs[-1], num_samples=1).item()
+                # next_token = torch.argmax(seq_probs[-1]).item()
 
             final_token_ids.append(next_token)
 

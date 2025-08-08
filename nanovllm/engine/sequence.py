@@ -36,6 +36,10 @@ class Sequence:
         # Tokens accepted from the draft model to be committed by the scheduler
         self.pending_accepted_tokens: list[int] = []
 
+        # Speculative decoding metrics, sequence level
+        self.num_speculative_proposed_total: int = 0
+        self.num_speculative_accepted_total: int = 0
+
     def __len__(self):
         return self.num_tokens
 
