@@ -72,25 +72,3 @@ class SpeculativeDecoder:
 
         return draft_tokens, draft_probs
 
-
-if __name__ == "__main__":
-    model_path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    num_speculative_tokens = 5
-    speculative_decoder = SpeculativeDecoder(
-        model_path, num_speculative_tokens)
-    prompt = "Introduce yourself."
-    prompt = speculative_decoder.tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False
-    )
-
-    input_ids = speculative_decoder.tokenizer.encode(prompt)
-    sequences = [input_ids]
-    temperatures = [1.0]
-    draft_tokens, draft_probs = speculative_decoder.generate_draft_tokens(
-        sequences, temperatures)
-    draft_reply = [speculative_decoder.tokenizer.decode(token) for token in draft_tokens][0]
-    print('prompt: ', prompt)
-    print('draft_reply: ', draft_reply)

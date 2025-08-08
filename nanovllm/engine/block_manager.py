@@ -83,7 +83,7 @@ class BlockManager:
             seq.block_table.append(block_id)
 
     def update_block(self, seq: Sequence):  # for speculative decoding
-        assert seq.is_speculative
+        assert len(seq.pending_accepted_tokens) > 0
         start_idx = seq.num_cached_blocks
         if start_idx >= seq.num_blocks:
             return
@@ -97,7 +97,7 @@ class BlockManager:
         h = prefix_hash
         for i in range(start_idx, seq.num_blocks):
             token_ids = seq.block(i)
-            if len(token_ids) != self.block_size:
+            if len(token_ids) != self.block_size:  # block is not full
                 break
 
             h = self.compute_hash(token_ids, h)
@@ -108,7 +108,7 @@ class BlockManager:
 
             if block_id in self.used_block_ids:
                 block = self.blocks[block_id]
-            else:
+            else:  # block is not used, allocate a new block
                 block = self._allocate_block(block_id)
 
             old_block_id = seq.block_table[i]

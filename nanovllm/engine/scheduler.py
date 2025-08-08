@@ -136,18 +136,17 @@ class Scheduler:
             return (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens
 
         for seq, token_id in zip(seqs, token_ids):
-            if seq.is_speculative:
+            if len(seq.pending_accepted_tokens) > 0:
                 for token in seq.pending_accepted_tokens:
                     seq.append_token(token)
-                    self.block_manager.may_append(seq)
                     if reach_end(seq, token):
                         seq.status = SequenceStatus.FINISHED
                         self.block_manager.deallocate(seq)
                         if seq in self.running:
                             self.running.remove(seq)
                         break
+                    self.block_manager.may_append(seq)
 
-                seq.pending_accepted_tokens = []
                 if seq.status != SequenceStatus.FINISHED:
                     seq.append_token(token_id)
                     if reach_end(seq, token_id):
@@ -157,7 +156,12 @@ class Scheduler:
                             self.running.remove(seq)
 
                 self.block_manager.update_block(seq)
+                seq.clear_draft_tokens()
                 continue
+
+            # all rejected
+            if len(seq.draft_tokens) > 0:
+                seq.clear_draft_tokens()
 
             # Handle chunked prefill: update cached tokens count
             if seq.num_tokens_to_process is not None:

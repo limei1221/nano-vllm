@@ -88,21 +88,12 @@ class Sequence:
         """Set draft tokens for speculative decoding."""
         self.draft_tokens = draft_tokens
         self.draft_probs = draft_probs
-        self.is_speculative = True
 
     def clear_draft_tokens(self):
         """Clear draft tokens after speculative decoding."""
         self.draft_tokens = []
         self.draft_probs = []
-        self.is_speculative = False
-
-    def set_pending_accepted_tokens(self, tokens: list[int]):
-        """Stash accepted speculative tokens to be committed by the scheduler.
-
-        Do not mutate token_ids or block_table here; the scheduler will update
-        KV-cache blocks via BlockManager to keep ownership consistent.
-        """
-        self.pending_accepted_tokens = list(tokens)
+        self.pending_accepted_tokens = []
 
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,

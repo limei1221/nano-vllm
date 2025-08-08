@@ -283,15 +283,15 @@ class ModelRunner:
         # Speculative sampling
         final_token_ids = []
         assert len(seqs) == len(speculative_seqs)
-        for i, seq in enumerate(seqs):
-            seq_logits = logits[i]  # [num_speculative_tokens + 1, vocab_size]
+        for seq_idx, seq in enumerate(seqs):
+            seq_logits = logits[seq_idx]  # [num_speculative_tokens + 1, vocab_size]
             seq_probs = torch.softmax(seq_logits, dim=-1)
             seq_target_probs = seq_probs[-len(seq.draft_tokens) - 1: -1]
             assert seq.draft_probs.shape == seq_target_probs.shape
             accepted_tokens = []
-            for i, draft_token in enumerate(seq.draft_tokens):
-                draft_prob = seq.draft_probs[i][draft_token]
-                target_prob = seq_target_probs[i][draft_token]
+            for token_idx, draft_token in enumerate(seq.draft_tokens):
+                draft_prob = seq.draft_probs[token_idx][draft_token]
+                target_prob = seq_target_probs[token_idx][draft_token]
                 accept_prob = torch.min(torch.ones_like(target_prob), target_prob / draft_prob)
                 if torch.rand(1, device=accept_prob.device) < accept_prob:
                    accepted_tokens.append(draft_token)
@@ -299,7 +299,7 @@ class ModelRunner:
                     break
 
             num_accepted = len(accepted_tokens)
-            seq.set_pending_accepted_tokens(accepted_tokens)
+            seq.pending_accepted_tokens = list(accepted_tokens)
             if num_accepted < len(seq.draft_tokens):
                 adjusted_probs = torch.clamp(
                     seq_target_probs[num_accepted] - seq.draft_probs[num_accepted],
@@ -312,8 +312,6 @@ class ModelRunner:
                 next_token = torch.multinomial(seq_probs[-1], num_samples=1).item()
 
             final_token_ids.append(next_token)
-
-            seq.clear_draft_tokens()
 
         del speculative_seqs
         reset_context()
