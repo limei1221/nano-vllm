@@ -12,6 +12,7 @@ from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.engine.speculative_decoder import SpeculativeDecoder
 from nanovllm.sampling_params import SamplingParams
+from transformers import AutoTokenizer
 
 
 class ModelRunner:
@@ -33,6 +34,7 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
 
         self.speculative_decoder = None
         if config.speculative_model and config.num_speculative_tokens > 0:
@@ -40,6 +42,7 @@ class ModelRunner:
                 config.speculative_model,
                 config.num_speculative_tokens
             )
+            assert self.speculative_decoder.tokenizer.vocab == self.tokenizer.vocab
 
         self.warmup_model()
         self.allocate_kv_cache()
@@ -256,10 +259,6 @@ class ModelRunner:
         for i, seq in enumerate(seqs):
             assert seq.num_completion_tokens <= seq.max_tokens
             seq.set_draft_tokens(draft_tokens[i], draft_probs[i])
-            # print('len(seq.draft_tokens): ', len(seq.draft_tokens))
-            # print('seq.draft_tokens: ', seq.draft_tokens)
-            # draft = [self.speculative_decoder.tokenizer.decode(token) for token in seq.draft_tokens]
-            # print('draft: ', draft)
             assert len(seq.draft_tokens) == len(seq.draft_probs)
 
             sampling_params = SamplingParams(
@@ -285,13 +284,14 @@ class ModelRunner:
         final_token_ids = []
         assert len(seqs) == len(speculative_seqs)
         for i, seq in enumerate(seqs):
-            cur_logits = logits[i]  # [num_speculative_tokens + 1, vocab_size]
-            cur_probs = self.sampler(cur_logits, seq.temperature * torch.ones(cur_logits.size(0), device=cur_logits.device), return_probs=True)
-            cur_target_probs = cur_probs[:-1]
+            seq_logits = logits[i]  # [num_speculative_tokens + 1, vocab_size]
+            seq_probs = torch.softmax(seq_logits, dim=-1)
+            seq_target_probs = seq_probs[-len(seq.draft_tokens) - 1: -1]
+            assert seq.draft_probs.shape == seq_target_probs.shape
             accepted_tokens = []
             for i, draft_token in enumerate(seq.draft_tokens):
                 draft_prob = seq.draft_probs[i][draft_token]
-                target_prob = cur_target_probs[i][draft_token]
+                target_prob = seq_target_probs[i][draft_token]
                 accept_prob = torch.min(torch.ones_like(target_prob), target_prob / draft_prob)
                 if torch.rand(1, device=accept_prob.device) < accept_prob:
                    accepted_tokens.append(draft_token)
@@ -300,17 +300,16 @@ class ModelRunner:
 
             num_accepted = len(accepted_tokens)
             seq.set_pending_accepted_tokens(accepted_tokens)
-            if num_accepted < self.config.num_speculative_tokens:
+            if num_accepted < len(seq.draft_tokens):
                 adjusted_probs = torch.clamp(
-                    cur_target_probs[num_accepted] - seq.draft_probs[num_accepted].to(cur_target_probs.device),
+                    seq_target_probs[num_accepted] - seq.draft_probs[num_accepted],
                     min=0,
                 )
                 adjusted_sum = adjusted_probs.sum()
-                assert adjusted_sum > 0
                 adjusted_probs = adjusted_probs / adjusted_sum
                 next_token = torch.multinomial(adjusted_probs, num_samples=1).item()
             else:
-                next_token = torch.multinomial(cur_probs[-1], num_samples=1).item()
+                next_token = torch.multinomial(seq_probs[-1], num_samples=1).item()
 
             final_token_ids.append(next_token)
 

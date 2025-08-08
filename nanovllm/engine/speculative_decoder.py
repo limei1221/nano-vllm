@@ -64,15 +64,10 @@ class SpeculativeDecoder:
             draft_tokens.append(new_tokens)
 
             scores_tensor = torch.stack(outputs.scores)  # [num_tokens, 1, vocab_size]
+            # scores from HF generate are already processed by temperature and other processors
             logits = scores_tensor.squeeze(1)  # [num_tokens, vocab_size]
-            if temp > 0:
-                logits = logits / temp
             probs = torch.softmax(logits, dim=-1)  # [num_tokens, vocab_size]
 
-            # token_indices = torch.tensor(new_tokens, device=probs.device).unsqueeze(1)  # [num_tokens, 1]
-            # token_probs = torch.gather(probs, 1, token_indices).squeeze(1)  # [num_tokens]
-
-            # probs = token_probs.tolist()
             draft_probs.append(probs)
 
         return draft_tokens, draft_probs
@@ -96,8 +91,6 @@ if __name__ == "__main__":
     temperatures = [1.0]
     draft_tokens, draft_probs = speculative_decoder.generate_draft_tokens(
         sequences, temperatures)
-    print('draft_tokens: ', draft_tokens)
-    print('draft_probs: ', draft_probs)
     draft_reply = [speculative_decoder.tokenizer.decode(token) for token in draft_tokens][0]
     print('prompt: ', prompt)
     print('draft_reply: ', draft_reply)

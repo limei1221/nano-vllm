@@ -5,7 +5,7 @@ import torch.distributed as dist
 
 from nanovllm.utils.context import get_context
 
-num_speculative_tokens=5
+NUM_SPECULATIVE_TOKENS=5
 
 class VocabParallelEmbedding(nn.Module):
 
@@ -63,7 +63,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         context = get_context()
         if context.is_speculative:
             last_indices = context.cu_seqlens_q[1:] - 1
-            start_indices = last_indices - num_speculative_tokens
+            start_indices = last_indices - NUM_SPECULATIVE_TOKENS
             ranges = []
             for start, end in zip(start_indices, last_indices):
                 ranges.append(torch.arange(start, end + 1))
