@@ -82,6 +82,49 @@ class BlockManager:
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
 
+    def update_block(self, seq: Sequence):  # for speculative decoding
+        assert seq.is_speculative
+        start_idx = seq.num_cached_blocks
+        if start_idx >= seq.num_blocks:
+            return
+
+        if start_idx > 0:
+            prev_block_id = seq.block_table[start_idx - 1]
+            prefix_hash = self.blocks[prev_block_id].hash
+        else:
+            prefix_hash = -1
+
+        h = prefix_hash
+        for i in range(start_idx, seq.num_blocks):
+            token_ids = seq.block(i)
+            if len(token_ids) != self.block_size:
+                break
+
+            h = self.compute_hash(token_ids, h)
+            block_id = self.hash_to_block_id.get(h, -1)
+            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                # cache miss
+                break
+
+            if block_id in self.used_block_ids:
+                block = self.blocks[block_id]
+            else:
+                block = self._allocate_block(block_id)
+
+            old_block_id = seq.block_table[i]
+            if old_block_id != block_id:
+                old_block = self.blocks[old_block_id]
+                old_block.ref_count -= 1
+                if old_block.ref_count == 0:
+                    self._deallocate_block(old_block_id)
+                seq.block_table[i] = block_id
+                block.ref_count += 1
+
+            block.update(h, token_ids)
+            self.hash_to_block_id[h] = block_id
+
+            seq.num_cached_tokens += self.block_size
+
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]

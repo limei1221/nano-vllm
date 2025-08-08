@@ -132,7 +132,33 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
+        def reach_end(seq: Sequence, token_id: int):
+            return (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens
+
         for seq, token_id in zip(seqs, token_ids):
+            if seq.is_speculative:
+                for token in seq.pending_accepted_tokens:
+                    seq.append_token(token)
+                    self.block_manager.may_append(seq)
+                    if reach_end(seq, token):
+                        seq.status = SequenceStatus.FINISHED
+                        self.block_manager.deallocate(seq)
+                        if seq in self.running:
+                            self.running.remove(seq)
+                        break
+
+                seq.pending_accepted_tokens = []
+                if seq.status != SequenceStatus.FINISHED:
+                    seq.append_token(token_id)
+                    if reach_end(seq, token_id):
+                        seq.status = SequenceStatus.FINISHED
+                        self.block_manager.deallocate(seq)
+                        if seq in self.running:
+                            self.running.remove(seq)
+
+                self.block_manager.update_block(seq)
+                continue
+
             # Handle chunked prefill: update cached tokens count
             if seq.num_tokens_to_process is not None:
                 seq.num_cached_tokens += seq.num_tokens_to_process
@@ -146,7 +172,7 @@ class Scheduler:
                         self.running.append(seq)
 
                     seq.append_token(token_id)
-                    if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    if reach_end(seq, token_id):
                         seq.status = SequenceStatus.FINISHED
                         self.block_manager.deallocate(seq)
                         self.running.remove(seq)
@@ -160,7 +186,7 @@ class Scheduler:
             else:
                 # Normal decode phase
                 seq.append_token(token_id)
-                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                if reach_end(seq, token_id):
                     seq.status = SequenceStatus.FINISHED
                     self.block_manager.deallocate(seq)
                     self.running.remove(seq)

@@ -17,10 +17,9 @@ def main():
         num_speculative_tokens=5,
     )
 
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=128)
     prompts = [
         "introduce yourself",
-        "list all prime numbers within 100",
     ]
     # prompts = [
     #     "This is a very long prompt that will definitely need chunked prefill. " * 70 + "Please provide a comprehensive analysis of artificial intelligence." for _ in range(3)

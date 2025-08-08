@@ -5,6 +5,7 @@ import torch.distributed as dist
 
 from nanovllm.utils.context import get_context
 
+num_speculative_tokens=5
 
 class VocabParallelEmbedding(nn.Module):
 
@@ -60,7 +61,15 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, x: torch.Tensor):
         context = get_context()
-        if context.is_prefill:
+        if context.is_speculative:
+            last_indices = context.cu_seqlens_q[1:] - 1
+            start_indices = last_indices - num_speculative_tokens
+            ranges = []
+            for start, end in zip(start_indices, last_indices):
+                ranges.append(torch.arange(start, end + 1))
+            all_indices = torch.cat(ranges)
+            x = x[all_indices].contiguous()
+        elif context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight, self.bias)

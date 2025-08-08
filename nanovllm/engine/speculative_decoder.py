@@ -28,7 +28,7 @@ class SpeculativeDecoder:
         self,
         sequences: List[List[int]],
         temperatures: List[float]
-    ) -> Tuple[List[List[int]], List[List[float]]]:
+    ) -> Tuple[List[List[int]], List[torch.Tensor]]:
         """
         Generate draft tokens using the small model.
 
@@ -69,10 +69,10 @@ class SpeculativeDecoder:
                 logits = logits / temp
             probs = torch.softmax(logits, dim=-1)  # [num_tokens, vocab_size]
 
-            token_indices = torch.tensor(new_tokens, device=probs.device).unsqueeze(1)  # [num_tokens, 1]
-            token_probs = torch.gather(probs, 1, token_indices).squeeze(1)  # [num_tokens]
+            # token_indices = torch.tensor(new_tokens, device=probs.device).unsqueeze(1)  # [num_tokens, 1]
+            # token_probs = torch.gather(probs, 1, token_indices).squeeze(1)  # [num_tokens]
 
-            probs = token_probs.tolist()
+            # probs = token_probs.tolist()
             draft_probs.append(probs)
 
         return draft_tokens, draft_probs
