@@ -35,20 +35,19 @@ class ModelRunner:
         self.sampler = Sampler()
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
 
-        self.draft_model = None
+        self.speculative_model = None
         self.num_speculative_tokens = 0
         if config.speculative_model and config.num_speculative_tokens > 0:
-            self.draft_model_hf_config = AutoConfig.from_pretrained(config.speculative_model)
-            torch.set_default_device("cuda")
-            self.draft_model = Qwen3ForCausalLM(self.draft_model_hf_config)
-            load_model(self.draft_model, config.speculative_model)
+            self.speculative_model_hf_config = AutoConfig.from_pretrained(config.speculative_model)
+            self.speculative_model = Qwen3ForCausalLM(self.speculative_model_hf_config)
+            load_model(self.speculative_model, config.speculative_model)
             self.num_speculative_tokens = config.num_speculative_tokens
 
-            self.draft_model_tokenizer = AutoTokenizer.from_pretrained(config.speculative_model, use_fast=True) # use fast tokenizer for draft model
-            assert self.draft_model_tokenizer.vocab == self.tokenizer.vocab
+            self.speculative_model_tokenizer = AutoTokenizer.from_pretrained(config.speculative_model, use_fast=True)
+            assert self.speculative_model_tokenizer.vocab == self.tokenizer.vocab
 
         self.warmup_model()
-        self.allocate_kv_cache()
+        self.allocate_kv_cache()  # allocate kv cache for self.model
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -149,7 +148,7 @@ class ModelRunner:
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
-            assert seq.num_cached_tokens < seq.num_prompt_tokens
+            # assert seq.num_cached_tokens < seq.num_prompt_tokens
             # assert seq.num_tokens - seq.num_cached_tokens > 1
             # Handle chunked prefill: only process specified number of tokens
             if seq.num_tokens_to_process is not None:
@@ -169,9 +168,10 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
+            # for i in range(seq.num_cached_blocks, seq.num_blocks):
+            for i in range(seq.num_cached_blocks, len(seq.block_table)):
                 start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
+                if i != len(seq.block_table) - 1:
                     end = start + self.block_size
                 else:
                     end = start + seq.last_block_num_tokens 
@@ -234,11 +234,9 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        # Handle speculative decoding for decode phase
-        if not is_prefill and self.draft_model and self.rank == 0:
+        if not is_prefill and self.speculative_model and self.rank == 0:
             return self.run_speculative_decode(seqs)
 
-        # Original non-speculative path
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
@@ -247,12 +245,9 @@ class ModelRunner:
         return token_ids
 
     def run_speculative_decode(self, seqs: list[Sequence]) -> list[int]:
-        """
-        Run speculative decoding for the given sequences.
-        """
         # Generate draft outputs using draft model
         temperatures = self.prepare_sample(seqs)
-        draft_tokens, draft_probs = self.generate_draft_tokens_with_draft_model(
+        draft_tokens, draft_probs = self.generate_draft_tokens(
                 seqs, temperatures, self.num_speculative_tokens
             )
 
@@ -329,18 +324,13 @@ class ModelRunner:
         return final_token_ids
 
     @torch.inference_mode()
-    def generate_draft_tokens_with_draft_model(
+    def generate_draft_tokens(
         self,
         seqs: list[Sequence],
         temperatures: list[float],
         max_new_tokens: int,
     ):
-        """Generate draft tokens using our small model via full prefill passes per step.
 
-        We recompute attention over the full sequence (no prefix cache) each step,
-        which is simpler and correct. This leverages the same model stack and avoids
-        relying on HF generate.
-        """
         draft_tokens: list[list[int]] = []
         draft_probs: list[torch.Tensor] = []
 
@@ -356,7 +346,7 @@ class ModelRunner:
                 synth.is_speculative = True
 
                 input_ids, positions = self.prepare_prefill([synth])
-                logits_all = self.draft_model.compute_logits(self.draft_model(input_ids, positions))
+                logits_all = self.speculative_model.compute_logits(self.speculative_model(input_ids, positions))
                 last_logits = logits_all[-1]
 
                 if temp and temp > 0:

@@ -95,7 +95,8 @@ class BlockManager:
             prefix_hash = -1
 
         h = prefix_hash
-        for i in range(start_idx, seq.num_blocks):
+        # for i in range(start_idx, seq.num_blocks):
+        for i in range(start_idx, len(seq.block_table)):
             token_ids = seq.block(i)
             if len(token_ids) != self.block_size:  # block is not full
                 break

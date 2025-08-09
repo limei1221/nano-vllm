@@ -11,8 +11,20 @@ def main():
     max_input_len = 1024
     max_ouput_len = 1024
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    llm = LLM(path, enforce_eager=False, enable_chunked_prefill=False, max_model_len=2048, max_num_seqs=128, max_num_batched_tokens=2048)
+    path = os.path.expanduser("~/huggingface/Qwen3-1.7B/")
+    # speculative_path = None
+    # num_speculative_tokens = 0
+    speculative_path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    num_speculative_tokens = 5
+
+    llm = LLM(path, enforce_eager=False,
+              max_model_len=2048,
+              max_num_seqs=128,
+              max_num_batched_tokens=4096,
+              enable_chunked_prefill=False,
+              speculative_model=speculative_path,
+              num_speculative_tokens=num_speculative_tokens,
+              )
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]

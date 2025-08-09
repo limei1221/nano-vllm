@@ -54,8 +54,8 @@ class LLMEngine:
             if seq.is_finished:
                 proposed = getattr(seq, "num_speculative_proposed_total", 0)
                 accepted = getattr(seq, "num_speculative_accepted_total", 0)
-                accept_rate = (accepted / proposed) if proposed > 0 else None
-                outputs.append((seq.seq_id, seq.completion_token_ids, accept_rate))
+                # accept_rate = (accepted / proposed) if proposed > 0 else None
+                outputs.append((seq.seq_id, seq.completion_token_ids, proposed, accepted))
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
 
@@ -89,15 +89,16 @@ class LLMEngine:
                     "Decode": f"{int(decode_throughput)}tok/s",
                 })
             for item in output:
-                seq_id, token_ids, accept_rate = item
-                outputs[seq_id] = {"token_ids": token_ids, "accept_rate": accept_rate}
+                seq_id, token_ids, proposed, accepted = item
+                outputs[seq_id] = {"token_ids": token_ids, "proposed": proposed, "accepted": accepted}
                 if use_tqdm:
                     pbar.update(1)
         ordered = [outputs[seq_id] for seq_id in sorted(outputs)]
         outputs = [{
             "text": self.tokenizer.decode(item["token_ids"], skip_special_tokens=True),
             "token_ids": item["token_ids"],
-            "accept_rate": item["accept_rate"],
+            "proposed": item["proposed"],
+            "accepted": item["accepted"],
         } for item in ordered]
         if use_tqdm:
             pbar.close()
