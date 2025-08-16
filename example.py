@@ -4,33 +4,33 @@ from transformers import AutoTokenizer
 
 
 def main():
-    model = os.path.expanduser("~/huggingface/Qwen3-1.7B/")
-    tokenizer = AutoTokenizer.from_pretrained(model)
+    path = os.path.expanduser("~/huggingface/Qwen3-1.7B/")
+    tokenizer = AutoTokenizer.from_pretrained(path)
     speculative_model = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
     # speculative_model = None
 
     llm = LLM(
-        model,
+        path,
+        enforce_eager=True,
         tensor_parallel_size=1,
-        enable_chunked_prefill=True,
         max_model_len=512,
         max_num_batched_tokens=1024,
+        enable_chunked_prefill=False,
         speculative_model=speculative_model,
         num_speculative_tokens=5,
     )
 
-    sampling_params = SamplingParams(temperature=0.2, max_tokens=128)
-    prompts = [
-        "introduce yourself",
-    ]
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=128)
     # prompts = [
     #     "introduce yourself",
     #     "list all prime numbers within 100",
-    #     "This is a very long prompt that will definitely need chunked prefill. " * 70 + "Please provide a comprehensive analysis of artificial intelligence."
     # ]
     # prompts = [
-    #     "This is a very long prompt that will definitely need chunked prefill. " * 70 + "Please provide a comprehensive analysis of artificial intelligence." for _ in range(3)
-    # ]
+    #     "This is a very long prompt that will definitely need chunked prefill. " * 70 + "Please provide a comprehensive analysis of artificial intelligence."
+    # ]  # len(tokens) = 1071
+    prompts = [
+        "introduce yourself",
+    ]
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],

@@ -135,6 +135,10 @@ class Scheduler:
         def reach_end(seq: Sequence, token_id: int):
             return (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens
 
+        for seq in seqs:
+            if len(seq.draft_tokens) > 0:
+                seq.clear_draft_tokens()
+
         for seq, token_id in zip(seqs, token_ids):
             if len(seq.pending_accepted_tokens) > 0:
                 for token in seq.pending_accepted_tokens:
@@ -146,29 +150,14 @@ class Scheduler:
                             self.running.remove(seq)
                         break
                     self.block_manager.may_append(seq)
-
-                if seq.status != SequenceStatus.FINISHED:
-                    seq.append_token(token_id)
-                    if reach_end(seq, token_id):
-                        seq.status = SequenceStatus.FINISHED
-                        self.block_manager.deallocate(seq)
-                        if seq in self.running:
-                            self.running.remove(seq)
-
                 self.block_manager.update_block(seq)
-                seq.clear_draft_tokens()
-                continue
+                seq.pending_accepted_tokens.clear()
 
-            # all rejected
-            if len(seq.draft_tokens) > 0:
-                seq.clear_draft_tokens()
-
-            # Handle chunked prefill: update cached tokens count
+            # Prefill phase
             if seq.num_tokens_to_process is not None:
                 seq.num_cached_tokens += seq.num_tokens_to_process
                 seq.num_tokens_to_process = None  # Reset for next iteration
-                # If we've processed all prompt tokens, move to decode phase
-                if seq.num_cached_tokens >= seq.num_prompt_tokens:
+                if seq.num_cached_tokens >= seq.num_prompt_tokens:  # Move to decode phase
                     seq.status = SequenceStatus.RUNNING
                     if seq in self.waiting:
                         self.waiting.remove(seq)
@@ -180,15 +169,14 @@ class Scheduler:
                         seq.status = SequenceStatus.FINISHED
                         self.block_manager.deallocate(seq)
                         self.running.remove(seq)
-                else:
-                    # Still in prefill phase, keep in waiting for next chunk
+                else:  # Still in prefill phase
                     seq.status = SequenceStatus.WAITING
                     if seq in self.running:
                         self.running.remove(seq)
                     if seq not in self.waiting:
                         self.waiting.append(seq)
             else:
-                # Normal decode phase
+                # Decode phase
                 seq.append_token(token_id)
                 if reach_end(seq, token_id):
                     seq.status = SequenceStatus.FINISHED

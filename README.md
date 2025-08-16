@@ -70,6 +70,6 @@ See `bench.py` for benchmark.
 **Performance Results:**
 |   | enable_chunked_prefill | speculative_model | num_speculative_tokens | Output Tokens | Time (s) | Throughput (tokens/s) |
 |---|---|---|---|---|---|---|
-| | False | None       | 0    | 133,966 | 75.18 | 1782.01 |
-| | True  | None       | 0    | 133,966 | 80.01 | 1674.44 |
+| | False | None       | 0    | 133,966 | 32.09 | 4174.45 |
+| | True  | None       | 0    | 133,966 | 34.00 | 3940.70 |
 | | False | Qwen3-0.6B | 5    | 133,966 |  |  |

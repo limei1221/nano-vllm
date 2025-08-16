@@ -11,7 +11,7 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.sampling_params import SamplingParams
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 
 
 class ModelRunner:
@@ -153,6 +153,8 @@ class ModelRunner:
             # Handle chunked prefill: only process specified number of tokens
             if seq.num_tokens_to_process is not None:
                 tokens_to_process = min(seq.num_tokens_to_process, seqlen - seq.num_cached_tokens)
+                if seq.is_speculative:
+                    assert tokens_to_process >= self.num_speculative_tokens + 1
                 input_ids.extend(seq[seq.num_cached_tokens:seq.num_cached_tokens + tokens_to_process])
                 positions.extend(list(range(seq.num_cached_tokens, seq.num_cached_tokens + tokens_to_process)))
                 seqlen_q = tokens_to_process
@@ -168,10 +170,11 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:
                 continue
-            # for i in range(seq.num_cached_blocks, seq.num_blocks):
-            for i in range(seq.num_cached_blocks, len(seq.block_table)):
+            # if seqs[0].is_speculative:
+            #     continue
+            for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
-                if i != len(seq.block_table) - 1:
+                if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
                     end = start + seq.last_block_num_tokens 
@@ -183,7 +186,7 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(seqs[0].is_speculative, True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(seqs[0].is_speculative, self.num_speculative_tokens, True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -203,7 +206,7 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(False, self.num_speculative_tokens, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -333,36 +336,69 @@ class ModelRunner:
 
         draft_tokens: list[list[int]] = []
         draft_probs: list[torch.Tensor] = []
-
         for seq, temp in zip(seqs, temperatures):
             working_ids = list(seq.token_ids)
-            per_step_probs: list[torch.Tensor] = []
-            for _ in range(max_new_tokens):
-                sp = SamplingParams(temperature=temp, max_tokens=len(working_ids), ignore_eos=True)
-                synth = Sequence(working_ids, sp)
-                synth.block_table = []
-                synth.num_cached_tokens = 0
-                synth.num_tokens_to_process = len(working_ids)
-                synth.is_speculative = True
+            sp = SamplingParams(temperature=temp, max_tokens=len(working_ids)+max_new_tokens, ignore_eos=True)
+            draft_seq = Sequence(working_ids, sp)
+            draft_seq.block_table = []
+            draft_seq.num_cached_tokens = 0
+            draft_seq.is_speculative = False
 
-                input_ids, positions = self.prepare_prefill([synth])
+            seq_draft_tokens: list[int] = []
+            seq_draft_probs: list[torch.Tensor] = []
+            for _ in range(max_new_tokens):
+                draft_seq.num_tokens_to_process = len(draft_seq.token_ids)
+                input_ids, positions = self.prepare_prefill([draft_seq])
                 logits_all = self.speculative_model.compute_logits(self.speculative_model(input_ids, positions))
                 last_logits = logits_all[-1]
 
-                if temp and temp > 0:
+                if temp > 0.0:
                     probs = torch.softmax(last_logits / temp, dim=-1)
                     next_token = int(torch.multinomial(probs, num_samples=1).item())
                 else:
                     probs = torch.softmax(last_logits, dim=-1)
                     next_token = int(torch.argmax(last_logits).item())
-                working_ids.append(next_token)
-                per_step_probs.append(probs)
-                reset_context()
 
-            draft_tokens.append(working_ids[-max_new_tokens:])
-            draft_probs.append(torch.stack(per_step_probs, dim=0))
+                seq_draft_tokens.append(next_token)
+                seq_draft_probs.append(probs)
+
+                draft_seq.append_token(next_token)  # Update the sequence
+
+            draft_tokens.append(seq_draft_tokens)  # [5]
+            draft_probs.append(torch.stack(seq_draft_probs, dim=0))  # torch.Size([5, 151936])
+
+            del draft_seq
 
         return draft_tokens, draft_probs
+
+
+    def generate_draft_tokens_debug(self, seqs: list[Sequence], temperatures: list[float], max_new_tokens: int):
+        self.draft_model = AutoModelForCausalLM.from_pretrained(self.config.speculative_model)
+        self.draft_model.eval()
+
+        draft_tokens: list[list[int]] = []
+        draft_probs: list[torch.Tensor] = []
+        for seq, temp in zip(seqs, temperatures):
+            input_ids = seq.token_ids
+            input_ids = torch.tensor(input_ids).unsqueeze(0)
+            attention_mask = torch.ones_like(input_ids)
+            with torch.no_grad():
+                draft_outputs = self.draft_model.generate(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+            seq_draft_tokens = draft_outputs.sequences[:, input_ids.size(1):].squeeze(0).tolist()  # [5]
+            seq_draft_probs = torch.stack(draft_outputs.scores).softmax(-1).squeeze(1)  # torch.Size([5, 151936])
+            draft_tokens.append(seq_draft_tokens)
+            draft_probs.append(seq_draft_probs)
+
+        return draft_tokens, draft_probs
+
 
     @torch.inference_mode()
     def capture_cudagraph(self):
@@ -382,7 +418,7 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(False, self.num_speculative_tokens, False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture

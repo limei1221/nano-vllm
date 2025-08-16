@@ -97,7 +97,6 @@ class Sequence:
         """Clear draft tokens after speculative decoding."""
         self.draft_tokens = []
         self.draft_probs = []
-        self.pending_accepted_tokens = []
 
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,

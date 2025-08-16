@@ -35,7 +35,7 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     assert key.stride(-1) == 1 and value.stride(-1) == 1
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
-    assert slot_mapping.numel() >= N
+    assert slot_mapping.numel() >= N  # slot_mapping.numel() > N when the sequence has been chunked
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
@@ -62,10 +62,9 @@ class Attention(nn.Module):
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        # if k_cache.numel() == 0 or v_cache.numel() == 0:
+        # if k_cache.numel() and v_cache.numel():
         if (
-            k_cache.numel() > 0
-            and v_cache.numel() > 0
+            k_cache.numel() and v_cache.numel()
             and context.slot_mapping is not None
             and context.slot_mapping.numel() >= k.shape[0]
         ):
