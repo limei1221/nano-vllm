@@ -135,12 +135,9 @@ class Scheduler:
         def reach_end(seq: Sequence, token_id: int):
             return (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens
 
-        for seq in seqs:
-            if len(seq.draft_tokens) > 0:
-                seq.clear_draft_tokens()
-
         for seq, token_id in zip(seqs, token_ids):
-            if len(seq.pending_accepted_tokens) > 0:
+            if len(seq.pending_accepted_tokens) > 0:  # Speculative decoding
+                is_reach_end = False
                 for token in seq.pending_accepted_tokens:
                     seq.append_token(token)
                     if reach_end(seq, token):
@@ -148,13 +145,20 @@ class Scheduler:
                         self.block_manager.deallocate(seq)
                         if seq in self.running:
                             self.running.remove(seq)
+                        is_reach_end = True
                         break
                     self.block_manager.may_append(seq)
                 self.block_manager.update_block(seq)
                 seq.pending_accepted_tokens.clear()
-
-            # Prefill phase
-            if seq.num_tokens_to_process is not None:
+                seq.clear_draft_tokens()
+                if not is_reach_end:
+                    # append next token
+                    seq.append_token(token_id)
+                    if reach_end(seq, token_id):
+                        seq.status = SequenceStatus.FINISHED
+                        self.block_manager.deallocate(seq)
+                        self.running.remove(seq)
+            elif seq.num_tokens_to_process is not None:  # Prefill phase
                 seq.num_cached_tokens += seq.num_tokens_to_process
                 seq.num_tokens_to_process = None  # Reset for next iteration
                 if seq.num_cached_tokens >= seq.num_prompt_tokens:  # Move to decode phase

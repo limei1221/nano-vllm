@@ -170,8 +170,6 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:
                 continue
-            # if seqs[0].is_speculative:
-            #     continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
@@ -267,8 +265,8 @@ class ModelRunner:
                 ignore_eos=seq.ignore_eos
             )
             speculative_seq = Sequence(seq.token_ids + seq.draft_tokens, sampling_params)
-            speculative_seq.block_table = seq.block_table.copy()
-            speculative_seq.num_cached_tokens = seq.num_cached_tokens
+            # TODO: use prefilled kv_cache in seq
+            speculative_seq.num_cached_tokens = 0
             speculative_seq.num_tokens_to_process = speculative_seq.num_tokens - speculative_seq.num_cached_tokens
             speculative_seq.is_speculative = True
             speculative_seqs.append(speculative_seq)
@@ -294,15 +292,16 @@ class ModelRunner:
                 draft_prob = seq.draft_probs[token_idx][draft_token]
                 target_prob = seq_target_probs[token_idx][draft_token]
                 accept_prob = torch.min(torch.ones_like(target_prob), target_prob / draft_prob)
-                if torch.rand(1, device=accept_prob.device) < accept_prob:
-                   accepted_tokens.append(draft_token)
+                if seq.temperature > 0.0:
+                    if torch.rand(1, device=accept_prob.device) < accept_prob:
+                        accepted_tokens.append(draft_token)
+                        continue
                 else:
-                    break
-                # target_token = torch.argmax(seq_target_probs[token_idx]).item()
-                # if target_token == draft_token:
-                #     accepted_tokens.append(draft_token)
-                # else:
-                #     break
+                    target_token = torch.argmax(seq_target_probs[token_idx]).item()
+                    if target_token == draft_token:
+                        accepted_tokens.append(draft_token)
+                        continue
+                break
 
             num_accepted = len(accepted_tokens)
             seq.num_speculative_accepted_total += num_accepted
@@ -314,12 +313,15 @@ class ModelRunner:
                 )
                 adjusted_sum = adjusted_probs.sum()
                 adjusted_probs = adjusted_probs / adjusted_sum
-                next_token = torch.multinomial(adjusted_probs, num_samples=1).item()
-                # next_token = torch.argmax(seq_target_probs[num_accepted]).item()
+                if seq.temperature > 0.0:
+                     next_token = torch.multinomial(adjusted_probs, num_samples=1).item()
+                else:
+                    next_token = torch.argmax(adjusted_probs).item()
             else:
-                next_token = torch.multinomial(seq_probs[-1], num_samples=1).item()
-                # next_token = torch.argmax(seq_probs[-1]).item()
-
+                if seq.temperature > 0.0:
+                    next_token = torch.multinomial(seq_probs[-1], num_samples=1).item()
+                else:
+                    next_token = torch.argmax(seq_probs[-1]).item()
             final_token_ids.append(next_token)
 
         del speculative_seqs
@@ -368,34 +370,6 @@ class ModelRunner:
             draft_probs.append(torch.stack(seq_draft_probs, dim=0))  # torch.Size([5, 151936])
 
             del draft_seq
-
-        return draft_tokens, draft_probs
-
-
-    def generate_draft_tokens_debug(self, seqs: list[Sequence], temperatures: list[float], max_new_tokens: int):
-        self.draft_model = AutoModelForCausalLM.from_pretrained(self.config.speculative_model)
-        self.draft_model.eval()
-
-        draft_tokens: list[list[int]] = []
-        draft_probs: list[torch.Tensor] = []
-        for seq, temp in zip(seqs, temperatures):
-            input_ids = seq.token_ids
-            input_ids = torch.tensor(input_ids).unsqueeze(0)
-            attention_mask = torch.ones_like(input_ids)
-            with torch.no_grad():
-                draft_outputs = self.draft_model.generate(
-                    input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    return_dict_in_generate=True,
-                    output_scores=True,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                )
-            seq_draft_tokens = draft_outputs.sequences[:, input_ids.size(1):].squeeze(0).tolist()  # [5]
-            seq_draft_probs = torch.stack(draft_outputs.scores).softmax(-1).squeeze(1)  # torch.Size([5, 151936])
-            draft_tokens.append(seq_draft_tokens)
-            draft_probs.append(seq_draft_probs)
 
         return draft_tokens, draft_probs
 
