@@ -2,6 +2,8 @@ import os
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
+# import torch._dynamo
+# torch._dynamo.config.suppress_errors = True
 
 def main():
     path = os.path.expanduser("~/huggingface/Qwen3-1.7B/")
@@ -26,8 +28,8 @@ def main():
     #     "list all prime numbers within 100",
     # ]
     # prompts = [
-    #     "This is a very long prompt that will definitely need chunked prefill. " * 70 + "Please provide a comprehensive analysis of artificial intelligence."
-    # ]  # len(tokens) = 1071
+    #     "This is a very long prompt that will definitely need chunked prefill. " * 70 + "introduce yourself"
+    # ]  # len(tokens) = 1064
     prompts = [
         "introduce yourself",
     ]

@@ -35,7 +35,7 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     assert key.stride(-1) == 1 and value.stride(-1) == 1
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
-    assert slot_mapping.numel() >= N  # slot_mapping.numel() > N when the sequence has been chunked
+    assert slot_mapping.numel() == N
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
@@ -66,7 +66,6 @@ class Attention(nn.Module):
         if (
             k_cache.numel() and v_cache.numel()
             and context.slot_mapping is not None
-            and context.slot_mapping.numel() >= k.shape[0]
         ):
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
@@ -77,7 +76,11 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+            if context.is_speculative:
+                q = q.reshape(-1, context.num_speculative_tokens + 1, self.num_heads, self.head_dim)
+            else:
+                q = q.unsqueeze(1)
+            o = flash_attn_with_kvcache(q, k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 
                                         softmax_scale=self.scale, causal=True)
         o = o.view(-1, self.num_heads * self.head_dim)

@@ -83,7 +83,6 @@ class BlockManager:
             seq.block_table.append(block_id)
 
     def update_block(self, seq: Sequence):  # for speculative decoding
-        assert len(seq.pending_accepted_tokens) > 0
         start_idx = seq.num_cached_blocks
         if start_idx >= seq.num_blocks:
             return

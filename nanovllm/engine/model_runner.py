@@ -11,7 +11,7 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.sampling_params import SamplingParams
-from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoConfig
 
 
 class ModelRunner:
@@ -46,7 +46,7 @@ class ModelRunner:
             self.speculative_model_tokenizer = AutoTokenizer.from_pretrained(config.speculative_model, use_fast=True)
             assert self.speculative_model_tokenizer.vocab == self.tokenizer.vocab
 
-        self.warmup_model()
+        # self.warmup_model()
         self.allocate_kv_cache()  # allocate kv cache for self.model
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -148,35 +148,40 @@ class ModelRunner:
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
-            # assert seq.num_cached_tokens < seq.num_prompt_tokens
-            # assert seq.num_tokens - seq.num_cached_tokens > 1
+            # assert seq.num_processed_tokens < seq.num_prompt_tokens
             # Handle chunked prefill: only process specified number of tokens
-            if seq.num_tokens_to_process is not None:
-                tokens_to_process = min(seq.num_tokens_to_process, seqlen - seq.num_cached_tokens)
-                if seq.is_speculative:
-                    assert tokens_to_process >= self.num_speculative_tokens + 1
-                input_ids.extend(seq[seq.num_cached_tokens:seq.num_cached_tokens + tokens_to_process])
-                positions.extend(list(range(seq.num_cached_tokens, seq.num_cached_tokens + tokens_to_process)))
+            if seq.num_tokens_to_process is not None:  # Chunked prefill or Speculative verify
+                tokens_to_process = min(seq.num_tokens_to_process, seqlen - seq.num_processed_tokens)
+                input_ids.extend(seq[seq.num_processed_tokens: seq.num_processed_tokens + tokens_to_process])
+                positions.extend(list(range(seq.num_processed_tokens, seq.num_processed_tokens + tokens_to_process)))
                 seqlen_q = tokens_to_process
-                seqlen_k = seq.num_cached_tokens + tokens_to_process
+                seqlen_k = seq.num_processed_tokens + tokens_to_process
+                start_pos = seq.num_processed_tokens
+                if not seq.is_draft_seq:
+                    for pos in range(start_pos, start_pos + tokens_to_process):
+                        block_idx = pos // self.block_size
+                        offset_in_block = pos % self.block_size
+                        block_id = seq.block_table[block_idx]
+                        slot_mapping.append(block_id * self.block_size + offset_in_block)
             else:
                 input_ids.extend(seq[seq.num_cached_tokens:])
                 positions.extend(list(range(seq.num_cached_tokens, seqlen)))
                 seqlen_q = seqlen - seq.num_cached_tokens
                 seqlen_k = seqlen
+                if not seq.is_draft_seq:
+                    for i in range(seq.num_cached_blocks, seq.num_blocks):
+                        start = seq.block_table[i] * self.block_size
+                        if i != seq.num_blocks - 1:
+                            end = start + self.block_size
+                        else:
+                            end = start + seq.last_block_num_tokensq
+                        slot_mapping.extend(list(range(start, end)))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)  # cumulative sequence lengths
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -193,8 +198,8 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         for seq in seqs:
-            assert seq.num_cached_tokens >= seq.num_prompt_tokens
-            # assert seq.num_tokens - seq.num_cached_tokens == 1
+            assert seq.num_processed_tokens >= seq.num_prompt_tokens
+            # assert seq.num_tokens - seq.num_processed_tokens == 1
             input_ids.append(seq.last_token)
             positions.append(len(seq))
             context_lens.append(len(seq))
@@ -204,7 +209,7 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, self.num_speculative_tokens, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(seqs[0].is_speculative, self.num_speculative_tokens, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -252,39 +257,23 @@ class ModelRunner:
                 seqs, temperatures, self.num_speculative_tokens
             )
 
-        # Create speculative sequences
-        speculative_seqs = []
         for i, seq in enumerate(seqs):
-            assert seq.num_completion_tokens <= seq.max_tokens
             seq.set_draft_tokens(draft_tokens[i], draft_probs[i])
-            assert len(seq.draft_tokens) == len(seq.draft_probs)
+            assert len(seq.draft_tokens) == self.num_speculative_tokens
+            seq.num_tokens_to_process = self.num_speculative_tokens + 1
 
-            sampling_params = SamplingParams(
-                temperature=seq.temperature,
-                max_tokens=seq.max_tokens,
-                ignore_eos=seq.ignore_eos
-            )
-            speculative_seq = Sequence(seq.token_ids + seq.draft_tokens, sampling_params)
-            # TODO: use prefilled kv_cache in seq
-            speculative_seq.num_cached_tokens = 0
-            speculative_seq.num_tokens_to_process = speculative_seq.num_tokens - speculative_seq.num_cached_tokens
-            speculative_seq.is_speculative = True
-            speculative_seqs.append(speculative_seq)
-
-        # Target model single forward pass
-        input_ids, positions = self.prepare_prefill(speculative_seqs)
-        temperatures = self.prepare_sample(speculative_seqs)
-        logits = self.run_model(input_ids, positions, True)
-        logits = logits.reshape(len(speculative_seqs), -1, logits.size(-1))
+        # Verify the draft tokens
+        input_ids, positions = self.prepare_prefill(seqs)
+        logits = self.run_model(input_ids, positions, False)
+        logits = logits.reshape(len(seqs), -1, logits.size(-1))
         assert logits.size(1) == self.num_speculative_tokens + 1
 
         # Speculative sampling
         final_token_ids = []
-        assert len(seqs) == len(speculative_seqs)
         for seq_idx, seq in enumerate(seqs):
             seq_logits = logits[seq_idx]  # [num_speculative_tokens + 1, vocab_size]
             seq_probs = torch.softmax(seq_logits, dim=-1)
-            seq_target_probs = seq_probs[-len(seq.draft_tokens) - 1: -1]
+            seq_target_probs = seq_probs[:self.num_speculative_tokens]
             assert seq.draft_probs.shape == seq_target_probs.shape
             accepted_tokens = []
             seq.num_speculative_proposed_total += len(seq.draft_tokens)
@@ -324,7 +313,10 @@ class ModelRunner:
                     next_token = torch.argmax(seq_probs[-1]).item()
             final_token_ids.append(next_token)
 
-        del speculative_seqs
+        # Reset the draft tokens
+        for i, seq in enumerate(seqs):
+            seq.reset_draft_tokens()
+
         reset_context()
         return final_token_ids
 
@@ -345,6 +337,7 @@ class ModelRunner:
             draft_seq.block_table = []
             draft_seq.num_cached_tokens = 0
             draft_seq.is_speculative = False
+            draft_seq.is_draft_seq = True
 
             seq_draft_tokens: list[int] = []
             seq_draft_probs: list[torch.Tensor] = []
@@ -369,6 +362,7 @@ class ModelRunner:
             draft_tokens.append(seq_draft_tokens)  # [5]
             draft_probs.append(torch.stack(seq_draft_probs, dim=0))  # torch.Size([5, 151936])
 
+            reset_context()
             del draft_seq
 
         return draft_tokens, draft_probs

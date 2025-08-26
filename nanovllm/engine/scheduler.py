@@ -44,7 +44,7 @@ class Scheduler:
             self.waiting.popleft()
             self.running.append(seq)
             scheduled_seqs.append(seq)
-            seq.num_tokens_to_process = len(seq) - seq.num_cached_tokens
+            seq.num_tokens_to_process = len(seq) - seq.num_processed_tokens
         if scheduled_seqs:
             return scheduled_seqs, True
 
@@ -79,7 +79,7 @@ class Scheduler:
                 temp_waiting.append(seq)
                 continue
 
-            prompt_tokens_left = len(seq) - seq.num_cached_tokens
+            prompt_tokens_left = len(seq) - seq.num_processed_tokens
             assert prompt_tokens_left > 0
             if prompt_tokens_left <= token_budget:
                 if not seq.block_table:
@@ -136,7 +136,8 @@ class Scheduler:
             return (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens
 
         for seq, token_id in zip(seqs, token_ids):
-            if len(seq.pending_accepted_tokens) > 0:  # Speculative decoding
+            if seq.is_speculative:  # Speculative decoding
+                seq.num_processed_tokens += 1 + len(seq.pending_accepted_tokens)
                 is_reach_end = False
                 for token in seq.pending_accepted_tokens:
                     seq.append_token(token)
@@ -148,20 +149,22 @@ class Scheduler:
                         is_reach_end = True
                         break
                     self.block_manager.may_append(seq)
-                self.block_manager.update_block(seq)
+                # self.block_manager.update_block(seq)
                 seq.pending_accepted_tokens.clear()
                 seq.clear_draft_tokens()
-                if not is_reach_end:
-                    # append next token
-                    seq.append_token(token_id)
-                    if reach_end(seq, token_id):
-                        seq.status = SequenceStatus.FINISHED
-                        self.block_manager.deallocate(seq)
-                        self.running.remove(seq)
+                if is_reach_end:
+                    continue
+                # append next token
+                seq.append_token(token_id)
+                if reach_end(seq, token_id):
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    self.running.remove(seq)
+                seq.is_speculative = False
             elif seq.num_tokens_to_process is not None:  # Prefill phase
-                seq.num_cached_tokens += seq.num_tokens_to_process
+                seq.num_processed_tokens += seq.num_tokens_to_process
                 seq.num_tokens_to_process = None  # Reset for next iteration
-                if seq.num_cached_tokens >= seq.num_prompt_tokens:  # Move to decode phase
+                if seq.num_processed_tokens >= seq.num_prompt_tokens:  # Move to decode phase
                     seq.status = SequenceStatus.RUNNING
                     if seq in self.waiting:
                         self.waiting.remove(seq)

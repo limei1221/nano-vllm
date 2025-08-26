@@ -61,13 +61,8 @@ class ParallelLMHead(VocabParallelEmbedding):
     def forward(self, x: torch.Tensor):
         context = get_context()
         if context.is_speculative and context.num_speculative_tokens > 0:
-            last_indices = context.cu_seqlens_q[1:] - 1
-            start_indices = last_indices - context.num_speculative_tokens
-            ranges = []
-            for start, end in zip(start_indices, last_indices):
-                ranges.append(torch.arange(start, end + 1))
-            all_indices = torch.cat(ranges)
-            x = x[all_indices].contiguous()
+            assert x.shape[0] == context.num_speculative_tokens + 1
+            x = x.contiguous()
         elif context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
