@@ -174,7 +174,7 @@ class ModelRunner:
                         if i != seq.num_blocks - 1:
                             end = start + self.block_size
                         else:
-                            end = start + seq.last_block_num_tokensq
+                            end = start + seq.last_block_num_tokens
                         slot_mapping.extend(list(range(start, end)))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)  # cumulative sequence lengths
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
@@ -264,7 +264,7 @@ class ModelRunner:
 
         # Verify the draft tokens
         input_ids, positions = self.prepare_prefill(seqs)
-        logits = self.run_model(input_ids, positions, False)
+        logits = self.run_model(input_ids, positions, True)
         logits = logits.reshape(len(seqs), -1, logits.size(-1))
         assert logits.size(1) == self.num_speculative_tokens + 1
 

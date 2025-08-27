@@ -82,49 +82,6 @@ class BlockManager:
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
 
-    def update_block(self, seq: Sequence):  # for speculative decoding
-        start_idx = seq.num_cached_blocks
-        if start_idx >= seq.num_blocks:
-            return
-
-        if start_idx > 0:
-            prev_block_id = seq.block_table[start_idx - 1]
-            prefix_hash = self.blocks[prev_block_id].hash
-        else:
-            prefix_hash = -1
-
-        h = prefix_hash
-        # for i in range(start_idx, seq.num_blocks):
-        for i in range(start_idx, len(seq.block_table)):
-            token_ids = seq.block(i)
-            if len(token_ids) != self.block_size:  # block is not full
-                break
-
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                # cache miss
-                break
-
-            if block_id in self.used_block_ids:
-                block = self.blocks[block_id]
-            else:  # block is not used, allocate a new block
-                block = self._allocate_block(block_id)
-
-            old_block_id = seq.block_table[i]
-            if old_block_id != block_id:
-                old_block = self.blocks[old_block_id]
-                old_block.ref_count -= 1
-                if old_block.ref_count == 0:
-                    self._deallocate_block(old_block_id)
-                seq.block_table[i] = block_id
-                block.ref_count += 1
-
-            block.update(h, token_ids)
-            self.hash_to_block_id[h] = block_id
-
-            seq.num_cached_tokens += self.block_size
-
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
@@ -134,23 +91,47 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+    def can_append(self, seq: Sequence, speculative_decoding: bool = False, num_speculative_tokens: int = 0) -> bool:
+        if speculative_decoding:
+            target_len = len(seq) + num_speculative_tokens
+            needed_blocks = (target_len + self.block_size - 1) // self.block_size
+            current_blocks = len(seq.block_table)
+            required_blocks = max(0, needed_blocks - current_blocks)
+        else:
+            required_blocks = 1 if (len(seq) % self.block_size == 1) else 0
+        return len(self.free_block_ids) >= required_blocks
 
-    def may_append(self, seq: Sequence):
+    def may_append(self, seq: Sequence, speculative_decoding: bool, num_speculative_tokens: int):
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
-        if len(seq) % self.block_size == 1:  # a new block needs to be allocated
-            assert last_block.hash != -1
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            block_table.append(block_id)
-        elif len(seq) % self.block_size == 0:  # the last block gets finalized with a hash
-            assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks-1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
+
+        if speculative_decoding:
+            if len(seq) + num_speculative_tokens > len(block_table) * self.block_size:  # a new block needs to be allocated
+                # assert last_block.hash != -1
+                block_id = self.free_block_ids[0]
+                self._allocate_block(block_id)
+                block_table.append(block_id)
+            if len(seq) % self.block_size <= num_speculative_tokens:  # the last block gets finalized with a hash
+                if last_block.hash != -1:
+                    token_ids = seq.block(seq.num_blocks-1)
+                    prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                    h = self.compute_hash(token_ids, prefix)
+                    last_block.update(h, token_ids)
+                    self.hash_to_block_id[h] = last_block.block_id
+            else:
+                assert last_block.hash == -1
         else:
-            assert last_block.hash == -1
+            if len(seq) % self.block_size == 1:  # a new block needs to be allocated
+                assert last_block.hash != -1
+                block_id = self.free_block_ids[0]
+                self._allocate_block(block_id)
+                block_table.append(block_id)
+            elif len(seq) % self.block_size == 0:  # the last block gets finalized with a hash
+                assert last_block.hash == -1
+                token_ids = seq.block(seq.num_blocks-1)
+                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                h = self.compute_hash(token_ids, prefix)
+                last_block.update(h, token_ids)
+                self.hash_to_block_id[h] = last_block.block_id
+            else:
+                assert last_block.hash == -1

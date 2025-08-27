@@ -16,6 +16,9 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
+        self.speculative_decoding = config.speculative_model is not None and config.num_speculative_tokens > 0
+        self.num_speculative_tokens = config.num_speculative_tokens
+
     def is_finished(self):
         return not self.waiting and not self.running
 
@@ -51,7 +54,7 @@ class Scheduler:
         # decode
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            while not self.block_manager.can_append(seq, speculative_decoding=self.speculative_decoding, num_speculative_tokens=self.num_speculative_tokens):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -59,7 +62,7 @@ class Scheduler:
                     break
             else:
                 num_seqs += 1
-                self.block_manager.may_append(seq)
+                self.block_manager.may_append(seq, speculative_decoding=self.speculative_decoding, num_speculative_tokens=self.num_speculative_tokens)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
@@ -111,7 +114,7 @@ class Scheduler:
         # decode
         while self.running and token_budget >= 1 and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            while not self.block_manager.can_append(seq, speculative_decoding=self.speculative_decoding, num_speculative_tokens=self.num_speculative_tokens):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -119,7 +122,7 @@ class Scheduler:
                     break
             else:
                 num_seqs += 1
-                self.block_manager.may_append(seq)
+                self.block_manager.may_append(seq, speculative_decoding=self.speculative_decoding, num_speculative_tokens=self.num_speculative_tokens)
                 scheduled_seqs.append(seq)
                 token_budget -= 1
         assert scheduled_seqs
@@ -148,8 +151,6 @@ class Scheduler:
                             self.running.remove(seq)
                         is_reach_end = True
                         break
-                    self.block_manager.may_append(seq)
-                # self.block_manager.update_block(seq)
                 seq.pending_accepted_tokens.clear()
                 seq.clear_draft_tokens()
                 if is_reach_end:
