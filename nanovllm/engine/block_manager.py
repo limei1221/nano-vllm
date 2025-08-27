@@ -25,13 +25,23 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, num_draft_blocks: int = 0):
         assert num_blocks > 0
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+
+        self.speculative_decoding = False
+        self.draft_blocks = None
+        self.free_draft_block_ids = None
+        self.used_draft_block_ids = None
+        if num_draft_blocks > 0:
+            self.speculative_decoding = True
+            self.draft_blocks: list[Block] = [Block(i) for i in range(num_draft_blocks)]
+            self.free_draft_block_ids: deque[int] = deque(range(num_draft_blocks))
+            self.used_draft_block_ids: set[int] = set()
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -49,13 +59,29 @@ class BlockManager:
         self.used_block_ids.add(block_id)
         return self.blocks[block_id]
 
+    def _allocate_draft_block(self, block_id: int) -> Block:
+        block = self.draft_blocks[block_id]
+        assert block.ref_count == 0
+        block.reset()
+        self.free_draft_block_ids.remove(block_id)
+        self.used_draft_block_ids.add(block_id)
+        return self.draft_blocks[block_id]
+
     def _deallocate_block(self, block_id: int) -> Block:
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
+    def _deallocate_draft_block(self, block_id: int) -> Block:
+        assert self.draft_blocks[block_id].ref_count == 0
+        self.used_draft_block_ids.remove(block_id)
+        self.free_draft_block_ids.append(block_id)
+
     def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+        if not self.speculative_decoding:
+            return len(self.free_block_ids) >= seq.num_blocks
+        else:
+            return len(self.free_block_ids) >= seq.num_blocks and len(self.free_draft_block_ids) >= seq.num_draft_blocks
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
@@ -81,6 +107,13 @@ class BlockManager:
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
+        # Allocate draft blocks
+        if self.speculative_decoding:
+            assert not seq.draft_block_table
+            for i in range(seq.num_draft_blocks):
+                block_id = self.free_draft_block_ids[0]
+                block = self._allocate_draft_block(block_id)
+                seq.draft_block_table.append(block_id)
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -90,6 +123,14 @@ class BlockManager:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+        # Deallocate draft blocks
+        if self.speculative_decoding:
+            for block_id in reversed(seq.draft_block_table):
+                block = self.draft_blocks[block_id]
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self._deallocate_draft_block(block_id)
+            seq.draft_block_table.clear()
 
     def can_append(self, seq: Sequence, speculative_decoding: bool = False, num_speculative_tokens: int = 0) -> bool:
         if speculative_decoding:

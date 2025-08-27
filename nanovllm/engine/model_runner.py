@@ -3,6 +3,7 @@ import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
+from transformers import AutoTokenizer, AutoConfig
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
@@ -11,7 +12,6 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.sampling_params import SamplingParams
-from transformers import AutoTokenizer, AutoConfig
 
 
 class ModelRunner:
@@ -37,7 +37,8 @@ class ModelRunner:
 
         self.speculative_model = None
         self.num_speculative_tokens = 0
-        if config.speculative_model and config.num_speculative_tokens > 0:
+        self.speculative_decoding = config.speculative_model and config.num_speculative_tokens > 0
+        if self.speculative_decoding:
             self.speculative_model_hf_config = AutoConfig.from_pretrained(config.speculative_model)
             self.speculative_model = Qwen3ForCausalLM(self.speculative_model_hf_config)
             load_model(self.speculative_model, config.speculative_model)
@@ -46,7 +47,7 @@ class ModelRunner:
             self.speculative_model_tokenizer = AutoTokenizer.from_pretrained(config.speculative_model, use_fast=True)
             assert self.speculative_model_tokenizer.vocab == self.tokenizer.vocab
 
-        # self.warmup_model()
+        self.warmup_model()
         self.allocate_kv_cache()  # allocate kv cache for self.model
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -119,17 +120,60 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+
+        # Total bytes available for KV cache allocation (respecting utilization)
+        available_bytes = int(total * config.gpu_memory_utilization - used - peak + current)
+
+        # Split 70/30 between main and speculative models if speculative exists
+        main_budget = int(available_bytes * 0.7) if self.speculative_decoding else available_bytes
+        spec_budget = available_bytes - main_budget if self.speculative_decoding else 0
+
+        # Main model KV cache
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        config.num_kvcache_blocks = main_budget // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
+        self.kv_cache = torch.zeros(
+            2,
+            hf_config.num_hidden_layers,
+            config.num_kvcache_blocks,
+            self.block_size,
+            num_kv_heads,
+            hf_config.head_dim,
+            dtype=hf_config.torch_dtype,
+        )
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+
+        config.num_draft_kvcache_block = 0
+        self.draft_kv_cache = None
+        # Speculative model KV cache (30%) if present
+        if self.speculative_decoding and spec_budget > 0:
+            sconf = self.speculative_model_hf_config
+            s_num_kv_heads = sconf.num_key_value_heads // self.world_size
+            s_block_bytes = 2 * sconf.num_hidden_layers * self.block_size * s_num_kv_heads * sconf.head_dim * sconf.torch_dtype.itemsize
+            config.num_draft_kvcache_block = spec_budget // s_block_bytes
+            assert config.num_draft_kvcache_block > 0
+            if config.num_draft_kvcache_block > 0:
+                self.draft_kv_cache = torch.zeros(
+                    2,
+                    sconf.num_hidden_layers,
+                    config.num_draft_kvcache_block,
+                    self.block_size,
+                    s_num_kv_heads,
+                    sconf.head_dim,
+                    dtype=sconf.torch_dtype,
+                )
+                layer_id = 0
+                for module in self.speculative_model.modules():
+                    if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                        module.k_cache = self.draft_kv_cache[0, layer_id]
+                        module.v_cache = self.draft_kv_cache[1, layer_id]
+                        layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -157,7 +201,7 @@ class ModelRunner:
                 seqlen_q = tokens_to_process
                 seqlen_k = seq.num_processed_tokens + tokens_to_process
                 start_pos = seq.num_processed_tokens
-                if not seq.is_draft_seq:
+                if seq.block_table:
                     for pos in range(start_pos, start_pos + tokens_to_process):
                         block_idx = pos // self.block_size
                         offset_in_block = pos % self.block_size
@@ -168,7 +212,7 @@ class ModelRunner:
                 positions.extend(list(range(seq.num_cached_tokens, seqlen)))
                 seqlen_q = seqlen - seq.num_cached_tokens
                 seqlen_k = seqlen
-                if not seq.is_draft_seq:
+                if seq.block_table:
                     for i in range(seq.num_cached_blocks, seq.num_blocks):
                         start = seq.block_table[i] * self.block_size
                         if i != seq.num_blocks - 1:
@@ -180,8 +224,6 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:
-                continue
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -240,7 +282,7 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        if not is_prefill and self.speculative_model and self.rank == 0:
+        if not is_prefill and self.speculative_decoding and self.rank == 0:
             return self.run_speculative_decode(seqs)
 
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -334,15 +376,14 @@ class ModelRunner:
             working_ids = list(seq.token_ids)
             sp = SamplingParams(temperature=temp, max_tokens=len(working_ids)+max_new_tokens, ignore_eos=True)
             draft_seq = Sequence(working_ids, sp)
-            draft_seq.block_table = []
-            draft_seq.num_cached_tokens = 0
+            draft_seq.block_table = seq.draft_block_table
+            draft_seq.num_processed_tokens = seq.num_processed_tokens
             draft_seq.is_speculative = False
             draft_seq.is_draft_seq = True
 
             seq_draft_tokens: list[int] = []
             seq_draft_probs: list[torch.Tensor] = []
             for _ in range(max_new_tokens):
-                draft_seq.num_tokens_to_process = len(draft_seq.token_ids)
                 input_ids, positions = self.prepare_prefill([draft_seq])
                 logits_all = self.speculative_model.compute_logits(self.speculative_model(input_ids, positions))
                 last_logits = logits_all[-1]

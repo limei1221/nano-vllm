@@ -12,7 +12,7 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.enable_chunked_prefill = config.enable_chunked_prefill
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size, num_draft_blocks=config.num_draft_kvcache_block)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -82,11 +82,12 @@ class Scheduler:
                 temp_waiting.append(seq)
                 continue
 
+            if not seq.block_table:
+                self.block_manager.allocate(seq)
+
             prompt_tokens_left = len(seq) - seq.num_processed_tokens
             assert prompt_tokens_left > 0
             if prompt_tokens_left <= token_budget:
-                if not seq.block_table:
-                    self.block_manager.allocate(seq)
                 seq.status = SequenceStatus.RUNNING
                 scheduled_seqs.append(seq)
                 num_seqs += 1
@@ -96,8 +97,6 @@ class Scheduler:
             else:
                 # Chunk the prompt
                 chunk_size = token_budget
-                if not seq.block_table:
-                    self.block_manager.allocate(seq)
                 seq.status = SequenceStatus.RUNNING
                 scheduled_seqs.append(seq)
                 num_seqs += 1
