@@ -81,7 +81,7 @@ class BlockManager:
         if not self.speculative_decoding:
             return len(self.free_block_ids) >= seq.num_blocks
         else:
-            return len(self.free_block_ids) >= seq.num_blocks and len(self.free_draft_block_ids) >= seq.num_draft_blocks
+            return len(self.free_block_ids) >= seq.num_blocks and len(self.free_draft_block_ids) >= seq.num_blocks
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
@@ -107,10 +107,11 @@ class BlockManager:
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
+
         # Allocate draft blocks
         if self.speculative_decoding:
             assert not seq.draft_block_table
-            for i in range(seq.num_draft_blocks):
+            for i in range(seq.num_blocks):
                 block_id = self.free_draft_block_ids[0]
                 block = self._allocate_draft_block(block_id)
                 seq.draft_block_table.append(block_id)
@@ -140,7 +141,11 @@ class BlockManager:
             required_blocks = max(0, needed_blocks - current_blocks)
         else:
             required_blocks = 1 if (len(seq) % self.block_size == 1) else 0
-        return len(self.free_block_ids) >= required_blocks
+
+        if speculative_decoding:
+            return len(self.free_block_ids) >= required_blocks and len(self.free_draft_block_ids) >= required_blocks
+        else:
+            return len(self.free_block_ids) >= required_blocks
 
     def may_append(self, seq: Sequence, speculative_decoding: bool, num_speculative_tokens: int):
         block_table = seq.block_table
@@ -151,6 +156,7 @@ class BlockManager:
                 # assert last_block.hash != -1
                 block_id = self.free_block_ids[0]
                 self._allocate_block(block_id)
+                self._allocate_draft_block(block_id)
                 block_table.append(block_id)
             if len(seq) % self.block_size <= num_speculative_tokens:  # the last block gets finalized with a hash
                 if last_block.hash != -1:
