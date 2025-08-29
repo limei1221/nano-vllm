@@ -149,22 +149,31 @@ class BlockManager:
 
     def may_append(self, seq: Sequence, speculative_decoding: bool, num_speculative_tokens: int):
         block_table = seq.block_table
+        draft_block_table = seq.draft_block_table
         last_block = self.blocks[block_table[-1]]
 
         if speculative_decoding:
-            if len(seq) + num_speculative_tokens > len(block_table) * self.block_size:  # a new block needs to be allocated
-                # assert last_block.hash != -1
-                block_id = self.free_block_ids[0]
-                self._allocate_block(block_id)
-                self._allocate_draft_block(block_id)
-                block_table.append(block_id)
-            if len(seq) % self.block_size <= num_speculative_tokens:  # the last block gets finalized with a hash
-                if last_block.hash != -1:
-                    token_ids = seq.block(seq.num_blocks-1)
-                    prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-                    h = self.compute_hash(token_ids, prefix)
-                    last_block.update(h, token_ids)
-                    self.hash_to_block_id[h] = last_block.block_id
+            need_new_block = (len(seq) + num_speculative_tokens > len(block_table) * self.block_size)
+            if need_new_block:
+                if last_block.hash == -1:
+                    token_ids = seq.block(seq.num_blocks - 1)
+                    if len(token_ids) == self.block_size:
+                        prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                        h = self.compute_hash(token_ids, prefix)
+                        last_block.update(h, token_ids)
+                        self.hash_to_block_id[h] = last_block.block_id
+                    else:
+                        assert last_block.hash == -1
+
+                main_block_id = self.free_block_ids[0]
+                self._allocate_block(main_block_id)
+                block_table.append(main_block_id)
+                last_block = self.blocks[block_table[-1]]
+
+                # draft block
+                draft_block_id = self.free_draft_block_ids[0]
+                self._allocate_draft_block(draft_block_id)
+                draft_block_table.append(draft_block_id)
             else:
                 assert last_block.hash == -1
         else:

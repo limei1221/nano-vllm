@@ -23,16 +23,13 @@ def main():
     )
 
     sampling_params = SamplingParams(temperature=0.0, max_tokens=128)
-    # prompts = [
-    #     "introduce yourself",
-    #     "list all prime numbers within 100",
-    # ]
+    prompts = [
+        "introduce yourself",
+        "list all prime numbers within 100",
+    ]
     # prompts = [
     #     "This is a very long prompt that will definitely need chunked prefill. " * 70 + "introduce yourself"
     # ]  # len(tokens) = 1064
-    prompts = [
-        "introduce yourself",
-    ]
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
@@ -55,8 +52,6 @@ def main():
     accept_rate = output["accepted"] / output["proposed"] if output["proposed"] > 0 else None
     if accept_rate is not None:
         print(f"Accept rate calculated over {len(prompts)} prompts: {accept_rate:.2f}")
-    else:
-        print("No speculative tokens proposed")
 
 
 if __name__ == "__main__":

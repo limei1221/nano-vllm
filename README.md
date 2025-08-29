@@ -63,13 +63,15 @@ See `bench.py` for benchmark.
 - Hardware: RTX 4090 (24GB)
 - Model: Qwen3-1.7B
 - Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
+- Input Length(default): Randomly sampled between 100–1024 tokens
 - Output Length: Randomly sampled between 100–1024 tokens
-- Config: max_model_len=2048, max_num_seqs=128, max_num_batched_tokens=4096
+- max_num_seqs=128
 
-**Performance Results:**
-|   | enable_chunked_prefill | speculative_model | num_speculative_tokens | Output Tokens | Time (s) | Throughput (tokens/s) |
-|---|---|---|---|---|---|---|
-| | False | None       | 0    | 133,966 | 32.09 | 4174.45 |
-| | True  | None       | 0    | 133,966 | 34.00 | 3940.70 |
-| | False | Qwen3-0.6B | 5    | 133,966 |  |  |
+**Performance results:**
+| | enable_chunked_prefill | input_length | max_model_len | max_num_batched_tokens |speculative_model | num_speculative_tokens | Output Tokens | Time (s) | Throughput (tokens/s) |
+|---|---|---|---|---|---|---|---|---|---|
+| | False | 100-1024 | 2048 | 4096   | None       | 0    | 133,966 | 31.56 | 4245.04 |
+| | True  | 100-1024 | 2048 | 4096   | None       | 0    | 133,966 | 33.16 | 4039.65 |
+| | False | 1025-1280 | 512 | 1024   | None       | 0    | - | - | - |
+| | True  | 1025-1280 | 512 | 1024   | None       | 0    | 149,755 | 55.15 | 2715.19 |
+| | False | 100-1024 | 2048 | 4096   | Qwen3-0.6B | 5    | 133,966 | 299.64 | 447.09 |
