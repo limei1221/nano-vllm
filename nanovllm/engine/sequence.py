@@ -92,7 +92,6 @@ class Sequence:
         self.draft_probs = draft_probs
         for token in draft_tokens:
             self.append_token(token)
-        self.is_speculative = True
 
     def reset_draft_tokens(self):
         for token in self.draft_tokens[::-1]:
@@ -102,7 +101,6 @@ class Sequence:
         self.last_token = self.token_ids[-1]
         self.draft_tokens = []
         self.draft_probs = []
-        # self.is_speculative = False
 
     def clear_draft_tokens(self):
         """Clear draft tokens after speculative decoding."""
@@ -110,31 +108,12 @@ class Sequence:
         self.draft_probs = []
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token,
-                self.num_tokens_to_process, self.draft_tokens, self.draft_probs, self.is_speculative)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, self.num_processed_tokens, self.num_tokens_to_process,
+                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
-        if len(state) == 9:
-            (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-             token_data, self.num_tokens_to_process, self.draft_tokens, self.draft_probs, self.is_speculative) = state
-        elif len(state) == 6:
-            # Format with num_tokens_to_process
-            self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data, self.num_tokens_to_process = state
-            self.draft_tokens = []
-            self.draft_probs = []
-            self.is_speculative = False
-        else:
-            # Old format without num_tokens_to_process
-            self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, token_data = state
-            self.num_tokens_to_process = None
-            self.draft_tokens = []
-            self.draft_probs = []
-            self.is_speculative = False
-        # Pending accepted tokens are transient and not serialized across workers
-        self.pending_accepted_tokens = []
-
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, self.num_processed_tokens, self.num_tokens_to_process = state[:-1]
         if self.num_completion_tokens == 0:
-            self.token_ids = token_data
+            self.token_ids = state[-1]
         else:
-            self.last_token = token_data
+            self.last_token = state[-1]

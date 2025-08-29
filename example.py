@@ -2,8 +2,6 @@ import os
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
-# import torch._dynamo
-# torch._dynamo.config.suppress_errors = True
 
 def main():
     path = os.path.expanduser("~/huggingface/Qwen3-1.7B/")
@@ -17,19 +15,21 @@ def main():
         tensor_parallel_size=1,
         max_model_len=512,
         max_num_batched_tokens=1024,
-        enable_chunked_prefill=False,
+        enable_chunked_prefill=True,
         speculative_model=speculative_model,
         num_speculative_tokens=5,
     )
 
     sampling_params = SamplingParams(temperature=0.0, max_tokens=128)
+    # prompts = [
+    #     "introduce yourself",
+    #     "list all prime numbers within 100",
+    # ]
     prompts = [
         "introduce yourself",
         "list all prime numbers within 100",
+        "This is a very long prompt that will definitely need chunked prefill. " * 70 + "introduce yourself"  # len(tokens) = 1064
     ]
-    # prompts = [
-    #     "This is a very long prompt that will definitely need chunked prefill. " * 70 + "introduce yourself"
-    # ]  # len(tokens) = 1064
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
