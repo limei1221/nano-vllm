@@ -25,7 +25,7 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int, num_draft_blocks: int = 0):
+    def __init__(self, num_blocks: int, block_size: int, num_draft_blocks: int = 0, speculative_decoding: bool = False, num_speculative_tokens: int = 0):
         assert num_blocks > 0
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
@@ -33,12 +33,13 @@ class BlockManager:
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
 
-        self.speculative_decoding = False
+        self.speculative_decoding = speculative_decoding
+        self.num_speculative_tokens = num_speculative_tokens
+
         self.draft_blocks = None
         self.free_draft_block_ids = None
         self.used_draft_block_ids = None
-        if num_draft_blocks > 0:
-            self.speculative_decoding = True
+        if self.speculative_decoding and num_draft_blocks > 0:
             self.draft_blocks: list[Block] = [Block(i) for i in range(num_draft_blocks)]
             self.free_draft_block_ids: deque[int] = deque(range(num_draft_blocks))
             self.used_draft_block_ids: set[int] = set()
@@ -133,27 +134,27 @@ class BlockManager:
                     self._deallocate_draft_block(block_id)
             seq.draft_block_table.clear()
 
-    def can_append(self, seq: Sequence, speculative_decoding: bool = False, num_speculative_tokens: int = 0) -> bool:
-        if speculative_decoding:
-            target_len = len(seq) + num_speculative_tokens
+    def can_append(self, seq: Sequence) -> bool:
+        if self.speculative_decoding:
+            target_len = len(seq) + self.num_speculative_tokens
             needed_blocks = (target_len + self.block_size - 1) // self.block_size
             current_blocks = len(seq.block_table)
             required_blocks = max(0, needed_blocks - current_blocks)
         else:
             required_blocks = 1 if (len(seq) % self.block_size == 1) else 0
 
-        if speculative_decoding:
+        if self.speculative_decoding:
             return len(self.free_block_ids) >= required_blocks and len(self.free_draft_block_ids) >= required_blocks
         else:
             return len(self.free_block_ids) >= required_blocks
 
-    def may_append(self, seq: Sequence, speculative_decoding: bool, num_speculative_tokens: int):
+    def may_append(self, seq: Sequence):
         block_table = seq.block_table
         draft_block_table = seq.draft_block_table
         last_block = self.blocks[block_table[-1]]
 
-        if speculative_decoding:
-            need_new_block = (len(seq) + num_speculative_tokens > len(block_table) * self.block_size)
+        if self.speculative_decoding:
+            need_new_block = (len(seq) + self.num_speculative_tokens > len(block_table) * self.block_size)
             if need_new_block:
                 if last_block.hash == -1:
                     token_ids = seq.block(seq.num_blocks - 1)

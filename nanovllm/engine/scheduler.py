@@ -12,12 +12,12 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.enable_chunked_prefill = config.enable_chunked_prefill
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size, num_draft_blocks=config.num_draft_kvcache_block)
+        self.speculative_decoding = config.speculative_model is not None and config.num_speculative_tokens > 0
+        self.num_speculative_tokens = config.num_speculative_tokens
+        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size, num_draft_blocks=config.num_draft_kvcache_block, speculative_decoding=self.speculative_decoding, num_speculative_tokens=self.num_speculative_tokens)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
-        self.speculative_decoding = config.speculative_model is not None and config.num_speculative_tokens > 0
-        self.num_speculative_tokens = config.num_speculative_tokens
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -54,7 +54,7 @@ class Scheduler:
         # decode
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq, speculative_decoding=self.speculative_decoding, num_speculative_tokens=self.num_speculative_tokens):
+            while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -62,7 +62,7 @@ class Scheduler:
                     break
             else:
                 num_seqs += 1
-                self.block_manager.may_append(seq, speculative_decoding=self.speculative_decoding, num_speculative_tokens=self.num_speculative_tokens)
+                self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
@@ -113,7 +113,7 @@ class Scheduler:
         # decode
         while self.running and token_budget >= 1 and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq, speculative_decoding=self.speculative_decoding, num_speculative_tokens=self.num_speculative_tokens):
+            while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -121,7 +121,7 @@ class Scheduler:
                     break
             else:
                 num_seqs += 1
-                self.block_manager.may_append(seq, speculative_decoding=self.speculative_decoding, num_speculative_tokens=self.num_speculative_tokens)
+                self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
                 token_budget -= 1
         assert scheduled_seqs
