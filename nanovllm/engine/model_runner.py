@@ -124,9 +124,17 @@ class ModelRunner:
         # Total bytes available for KV cache allocation (respecting utilization)
         available_bytes = int(total * config.gpu_memory_utilization - used - peak + current)
 
-        # Split 70/30 between main and speculative models if speculative exists
-        main_budget = int(available_bytes * 0.7) if self.speculative_decoding else available_bytes
-        spec_budget = available_bytes - main_budget if self.speculative_decoding else 0
+        target_split = 1.0
+        if self.speculative_decoding:
+            sconf = self.speculative_model_hf_config
+            split_ratio = (hf_config.num_hidden_layers * hf_config.num_key_value_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize) / (sconf.num_hidden_layers * sconf.num_key_value_heads * sconf.head_dim * sconf.torch_dtype.itemsize)
+            target_split = split_ratio / (1 + split_ratio)
+            assert target_split >= 0.5 and target_split < 1.0
+            print('target_split: ', target_split)
+
+        # Split between main and speculative models
+        main_budget = int(available_bytes * target_split)
+        spec_budget = available_bytes - main_budget
 
         # Main model KV cache
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
@@ -151,9 +159,8 @@ class ModelRunner:
 
         config.num_draft_kvcache_block = 0
         self.draft_kv_cache = None
-        # Speculative model KV cache (30%) if present
+        # Speculative model KV cache, if present
         if self.speculative_decoding and spec_budget > 0:
-            sconf = self.speculative_model_hf_config
             s_num_kv_heads = sconf.num_key_value_heads // self.world_size
             s_block_bytes = 2 * sconf.num_hidden_layers * self.block_size * s_num_kv_heads * sconf.head_dim * sconf.torch_dtype.itemsize
             config.num_draft_kvcache_block = spec_budget // s_block_bytes
@@ -181,7 +188,7 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence]):
+    def prepare_prefill(self, seqs: list[Sequence], is_draft: bool = False):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -192,9 +199,8 @@ class ModelRunner:
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
-            # assert seq.num_processed_tokens < seq.num_prompt_tokens
             # Handle chunked prefill: only process specified number of tokens
-            if seq.num_tokens_to_process is not None:  # Chunked prefill or Speculative verify
+            if seq.num_tokens_to_process is not None:  # Chunked prefill or Speculative verify or generate draft tokens
                 tokens_to_process = min(seq.num_tokens_to_process, seqlen - seq.num_processed_tokens)
                 input_ids.extend(seq[seq.num_processed_tokens: seq.num_processed_tokens + tokens_to_process])
                 positions.extend(list(range(seq.num_processed_tokens, seq.num_processed_tokens + tokens_to_process)))
@@ -234,14 +240,12 @@ class ModelRunner:
         set_context(seqs[0].is_speculative, self.num_speculative_tokens, True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
-    def prepare_decode(self, seqs: list[Sequence]):
+    def prepare_decode(self, seqs: list[Sequence], is_draft: bool = False):
         input_ids = []
         positions = []
         slot_mapping = []
         context_lens = []
         for seq in seqs:
-            assert seq.num_processed_tokens >= seq.num_prompt_tokens
-            # assert seq.num_tokens - seq.num_processed_tokens == 1
             input_ids.append(seq.last_token)
             positions.append(len(seq))
             context_lens.append(len(seq))
@@ -294,21 +298,18 @@ class ModelRunner:
 
     def run_speculative_decode(self, seqs: list[Sequence]) -> list[int]:
         # Generate draft outputs using draft model
-        temperatures = self.prepare_sample(seqs)
         draft_tokens, draft_probs = self.generate_draft_tokens(
-                seqs, temperatures, self.num_speculative_tokens
+                seqs, self.num_speculative_tokens
             )
 
         for i, seq in enumerate(seqs):
             seq.set_draft_tokens(draft_tokens[i], draft_probs[i])
-            assert len(seq.draft_tokens) == self.num_speculative_tokens
             seq.num_tokens_to_process = self.num_speculative_tokens + 1
 
         # Verify the draft tokens
         input_ids, positions = self.prepare_prefill(seqs)
         logits = self.run_model(input_ids, positions, True)
         logits = logits.reshape(len(seqs), -1, logits.size(-1))
-        assert logits.size(1) == self.num_speculative_tokens + 1
 
         # Speculative sampling
         final_token_ids = []
@@ -366,46 +367,63 @@ class ModelRunner:
     def generate_draft_tokens(
         self,
         seqs: list[Sequence],
-        temperatures: list[float],
         max_new_tokens: int,
     ):
 
-        draft_tokens: list[list[int]] = []
-        draft_probs: list[torch.Tensor] = []
-        for seq, temp in zip(seqs, temperatures):
+        num_seqs = len(seqs)
+
+        draft_tokens: list[list[int]] = [[] for _ in range(num_seqs)]
+        draft_probs_lists: list[list[torch.Tensor]] = [[] for _ in range(num_seqs)]
+
+        draft_seqs: list[Sequence] = []
+        for seq_idx, seq in enumerate(seqs):
             working_ids = list(seq.token_ids)
-            sp = SamplingParams(temperature=temp, max_tokens=len(working_ids)+max_new_tokens, ignore_eos=True)
+            sp = SamplingParams(temperature=seq.temperature, max_tokens=len(working_ids) + max_new_tokens, ignore_eos=True)
             draft_seq = Sequence(working_ids, sp)
             draft_seq.block_table = seq.draft_block_table
-            draft_seq.num_processed_tokens = seq.num_processed_tokens
+            if seq.num_processed_tokens == seq.num_prompt_tokens:
+                draft_seq.num_processed_tokens = 0
+                draft_seq.num_tokens_to_process = draft_seq.num_tokens
+            else:
+                draft_seq.num_processed_tokens = seq.draft_num_processed_tokens
+                draft_seq.num_tokens_to_process = draft_seq.num_tokens - draft_seq.num_processed_tokens
+            # draft_seq.num_tokens_to_process = None
             draft_seq.is_speculative = False
-            draft_seq.is_draft_seq = True
+            draft_seqs.append(draft_seq)
 
-            seq_draft_tokens: list[int] = []
-            seq_draft_probs: list[torch.Tensor] = []
-            for _ in range(max_new_tokens):
-                input_ids, positions = self.prepare_prefill([draft_seq])
-                logits_all = self.speculative_model.compute_logits(self.speculative_model(input_ids, positions))
-                last_logits = logits_all[-1]
+        for i in range(max_new_tokens):
+            input_ids, positions = self.prepare_prefill(draft_seqs)
+            # if i == 0:
+            #     input_ids, positions = self.prepare_prefill(draft_seqs)
+            # else:
+            #     input_ids, positions = self.prepare_decode(draft_seqs)
+            last_logits = self.speculative_model.compute_logits(self.speculative_model(input_ids, positions))
 
-                if temp > 0.0:
-                    probs = torch.softmax(last_logits / temp, dim=-1)
+            for i in range(num_seqs):
+                draft_seq = draft_seqs[i]
+                ll = last_logits[i]
+                if draft_seq.temperature > 0.0:
+                    probs = torch.softmax(ll / draft_seq.temperature, dim=-1)
                     next_token = int(torch.multinomial(probs, num_samples=1).item())
                 else:
-                    probs = torch.softmax(last_logits, dim=-1)
-                    next_token = int(torch.argmax(last_logits).item())
+                    probs = torch.softmax(ll, dim=-1)
+                    next_token = int(torch.argmax(ll).item())
 
-                seq_draft_tokens.append(next_token)
-                seq_draft_probs.append(probs)
+                draft_tokens[i].append(next_token)
+                draft_probs_lists[i].append(probs)
 
-                draft_seq.append_token(next_token)  # Update the sequence
-
-            draft_tokens.append(seq_draft_tokens)  # [5]
-            draft_probs.append(torch.stack(seq_draft_probs, dim=0))  # torch.Size([5, 151936])
+                draft_seq.num_processed_tokens += draft_seq.num_tokens_to_process
+                draft_seq.append_token(next_token)
+                draft_seq.num_tokens_to_process = 1
 
             reset_context()
-            del draft_seq
 
+        draft_probs: list[torch.Tensor] = [
+            torch.stack(prob_list, dim=0) if len(prob_list) > 0 else torch.empty((0,), device=temperatures.device)
+            for prob_list in draft_probs_lists
+        ]
+
+        del draft_seqs
         return draft_tokens, draft_probs
 
 

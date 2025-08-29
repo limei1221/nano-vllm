@@ -140,6 +140,10 @@ class Scheduler:
         for seq, token_id in zip(seqs, token_ids):
             if seq.is_speculative:  # Speculative decoding
                 seq.num_processed_tokens += 1 + len(seq.pending_accepted_tokens)
+                if len(seq.pending_accepted_tokens) < self.num_speculative_tokens:
+                    seq.draft_num_processed_tokens = seq.num_processed_tokens
+                else:  # the last draft token is not processed by draft model
+                    seq.draft_num_processed_tokens = seq.num_processed_tokens - 1
                 is_reach_end = False
                 for token in seq.pending_accepted_tokens:
                     seq.append_token(token)
