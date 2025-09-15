@@ -1,6 +1,8 @@
 import pickle
 import torch
 import torch.distributed as dist
+from torch.distributions import Categorical
+import torch.nn.functional as F
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 from transformers import AutoTokenizer, AutoConfig
@@ -46,6 +48,7 @@ class ModelRunner:
 
             self.speculative_model_tokenizer = AutoTokenizer.from_pretrained(config.speculative_model, use_fast=True)
             assert self.speculative_model_tokenizer.vocab == self.tokenizer.vocab
+        self.vocab_size = self.tokenizer.vocab_size
 
         self.warmup_model()
         self.allocate_kv_cache()  # allocate kv cache for self.model
@@ -247,7 +250,7 @@ class ModelRunner:
         context_lens = []
         for seq in seqs:
             input_ids.append(seq.last_token)
-            positions.append(len(seq))
+            positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -292,6 +295,7 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
+        self.vocab_size = logits.size(-1)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
@@ -303,13 +307,13 @@ class ModelRunner:
 
         for i, seq in enumerate(seqs):
             seq.is_speculative = True
-            seq.set_draft_tokens(draft_tokens[i], draft_probs[i])
+            seq.set_draft_tokens(draft_tokens[i])
             seq.num_tokens_to_process = self.num_speculative_tokens + 1
 
-        final_token_ids = self.verify_draft_tokens(seqs)
+        final_token_ids = self.verify_draft_tokens(seqs, draft_tokens, draft_probs)
 
         for i, seq in enumerate(seqs):
-            seq.reset_draft_tokens()
+            seq.reset_draft_tokens(self.num_speculative_tokens)
 
         return final_token_ids
 
@@ -322,113 +326,156 @@ class ModelRunner:
 
         num_seqs = len(seqs)
 
-        draft_tokens: list[list[int]] = [[] for _ in range(num_seqs)]
-        draft_probs_lists: list[list[torch.Tensor]] = [[] for _ in range(num_seqs)]
-
         draft_seqs: list[Sequence] = []
-        for seq_idx, seq in enumerate(seqs):
+        for seq in seqs:
             working_ids = list(seq.token_ids)
-            sp = SamplingParams(temperature=seq.temperature, max_tokens=len(working_ids) + max_new_tokens, ignore_eos=True)
+            sp = SamplingParams(
+                temperature=seq.temperature,
+                max_tokens=len(working_ids) + max_new_tokens,
+                ignore_eos=True,
+            )
             draft_seq = Sequence(working_ids, sp)
             draft_seq.block_table = seq.draft_block_table
+
             if seq.num_processed_tokens == seq.num_prompt_tokens:
                 draft_seq.num_processed_tokens = 0
                 draft_seq.num_tokens_to_process = draft_seq.num_tokens
             else:
                 draft_seq.num_processed_tokens = seq.draft_num_processed_tokens
                 draft_seq.num_tokens_to_process = draft_seq.num_tokens - draft_seq.num_processed_tokens
-            # draft_seq.num_tokens_to_process = None
+
             draft_seq.is_speculative = False
             draft_seqs.append(draft_seq)
 
-        for i in range(max_new_tokens):
-            input_ids, positions = self.prepare_prefill(draft_seqs)
-            # if i == 0:
-            #     input_ids, positions = self.prepare_prefill(draft_seqs)
-            # else:
-            #     input_ids, positions = self.prepare_decode(draft_seqs)
-            last_logits = self.speculative_model.compute_logits(self.speculative_model(input_ids, positions))
+        device = self.speculative_model.lm_head.weight.device
+        dtype = self.speculative_model.lm_head.weight.dtype
 
-            for i in range(num_seqs):
-                draft_seq = draft_seqs[i]
-                ll = last_logits[i]
-                if draft_seq.temperature > 0.0:
-                    probs = torch.softmax(ll / draft_seq.temperature, dim=-1)
-                    next_token = int(torch.multinomial(probs, num_samples=1).item())
-                else:
-                    probs = torch.softmax(ll, dim=-1)
-                    next_token = int(torch.argmax(ll).item())
+        draft_tokens = torch.empty((num_seqs, max_new_tokens), dtype=torch.int64, device=device)
+        draft_probs = torch.empty((num_seqs, max_new_tokens, self.vocab_size), dtype=dtype, device=device)
 
-                draft_tokens[i].append(next_token)
-                draft_probs_lists[i].append(probs)
+        temps = torch.tensor([ds.temperature for ds in draft_seqs], device=device, dtype=dtype)
+        greedy_mask = temps == 0
+        safe_temps = torch.where(greedy_mask, torch.ones_like(temps), temps)
 
-                draft_seq.num_processed_tokens += draft_seq.num_tokens_to_process
-                draft_seq.append_token(next_token)
-                draft_seq.num_tokens_to_process = 1
+        for t in range(max_new_tokens):
+            if t == 0:
+                input_ids, positions = self.prepare_prefill(draft_seqs)
+            else:
+                input_ids, positions = self.prepare_decode(draft_seqs)
 
-            reset_context()
+            last_logits = self.speculative_model.compute_logits(
+                self.speculative_model(input_ids, positions)
+            )  # (B, V)
 
-        draft_probs: list[torch.Tensor] = [
-            torch.stack(prob_list, dim=0) if len(prob_list) > 0 else torch.empty((0,), device=self.speculative_model.lm_head.weight.device)
-            for prob_list in draft_probs_lists
-        ]
+            scaled = last_logits / safe_temps[:, None]
+
+            next_tokens = torch.empty((num_seqs,), dtype=torch.long, device=device)
+
+            # 1) Sampling rows (temperature > 0)
+            sample_mask = ~greedy_mask
+            if sample_mask.any():
+                scaled_sample = scaled[sample_mask]                       # (B_s, V)
+                probs_sample = torch.softmax(scaled_sample, dim=-1)       # (B_s, V)
+                sampled = torch.multinomial(probs_sample, num_samples=1).squeeze(1)  # (B_s,)
+                next_tokens[sample_mask] = sampled
+
+                sample_indices = torch.nonzero(sample_mask, as_tuple=False).squeeze(1).tolist()
+                for j, seq_idx in enumerate(sample_indices):
+                    draft_probs[seq_idx, t] = probs_sample[j]
+
+            # 2) Greedy rows (temperature == 0)
+            if greedy_mask.any():
+                logits_greedy = last_logits[greedy_mask]                  # (B_g, V)
+                probs_greedy = torch.softmax(logits_greedy, dim=-1)       # (B_g, V)
+                argmax = torch.argmax(logits_greedy, dim=-1)              # (B_g,)
+                next_tokens[greedy_mask] = argmax
+
+                greedy_indices = torch.nonzero(greedy_mask, as_tuple=False).squeeze(1).tolist()
+                for j, seq_idx in enumerate(greedy_indices):
+                    draft_probs[seq_idx, t] = probs_greedy[j]
+
+            next_tokens_cpu = next_tokens.tolist()
+            for i, token in enumerate(next_tokens_cpu):
+                ds = draft_seqs[i]
+                draft_tokens[i, t] = int(token)
+                ds.num_processed_tokens += ds.num_tokens_to_process
+                ds.append_token(int(token))
+                ds.num_tokens_to_process = 1
+
+        reset_context()
 
         del draft_seqs
         return draft_tokens, draft_probs
 
     @torch.inference_mode()
-    def verify_draft_tokens(self, seqs: list[Sequence]) -> list[int]:
-        # Verify the draft tokens
+    def verify_draft_tokens(self, seqs: list[Sequence], draft_tokens: list[list[int]], draft_probs: list[list[torch.Tensor]]) -> list[int]:
+        """
+        A refactored, vectorized implementation of speculative decoding verification.
+        This version uses a high-level if/else block to separate the "all-accepted"
+        fast path from the more complex "mixed-case" path.
+        """
+        # forward model
         input_ids, positions = self.prepare_prefill(seqs)
         logits = self.run_model(input_ids, positions, True)
         logits = logits.reshape(len(seqs), -1, logits.size(-1))
         probs = torch.softmax(logits, dim=-1)
 
-        # Speculative sampling
-        final_token_ids: list[int] = []
-        for seq_idx, seq in enumerate(seqs):
-            seq_probs = probs[seq_idx]  # [num_speculative_tokens + 1, vocab_size]
-            seq_target_probs = seq_probs[:self.num_speculative_tokens]
-            assert seq.draft_probs.shape == seq_target_probs.shape
-            accepted_tokens = []
-            seq.num_speculative_proposed_total += len(seq.draft_tokens)
-            for token_idx, draft_token in enumerate(seq.draft_tokens):
-                draft_prob = seq.draft_probs[token_idx][draft_token]
-                target_prob = seq_target_probs[token_idx][draft_token]
-                accept_prob = torch.min(torch.ones_like(target_prob), target_prob / draft_prob)
-                if seq.temperature > 0.0:
-                    if torch.rand(1, device=accept_prob.device) < accept_prob:
-                        accepted_tokens.append(draft_token)
-                        continue
-                else:
-                    target_token = torch.argmax(seq_target_probs[token_idx]).item()
-                    if target_token == draft_token:
-                        accepted_tokens.append(draft_token)
-                        continue
-                break
+        B, _, V = probs.shape
+        K = self.num_speculative_tokens
+        device = probs.device
+        epsilon = 1e-8
 
-            num_accepted = len(accepted_tokens)
-            seq.num_speculative_accepted_total += num_accepted
-            seq.pending_accepted_tokens = list(accepted_tokens)
+        target_probs = probs[:, :K, :]
+        temps = torch.tensor([s.temperature for s in seqs], device=device).unsqueeze(-1)
+        greedy_mask = (temps == 0.0)
 
-            # sample next token
-            if num_accepted < len(seq.draft_tokens):
-                adjusted_probs = torch.clamp(
-                    seq_target_probs[num_accepted] - seq.draft_probs[num_accepted],
-                    min=0,
-                )
-                adjusted_sum = adjusted_probs.sum()
-                next_probs = adjusted_probs / adjusted_sum
-            else:
-                next_probs = seq_probs[-1]
-            if seq.temperature > 0.0:
-                next_token = torch.multinomial(next_probs, num_samples=1).item()
-            else:
-                next_token = torch.argmax(next_probs).item()
-            final_token_ids.append(next_token)
+        # verify draft tokens
+        indices = draft_tokens.unsqueeze(-1)  # [B, K, 1]
+        draft_token_probs_from_draft = torch.gather(draft_probs, 2, indices).squeeze(-1)
+        draft_token_probs_from_target = torch.gather(target_probs, 2, indices).squeeze(-1)
+        accept_ratio = draft_token_probs_from_target / (draft_token_probs_from_draft + epsilon)
+        accept_probs = torch.min(torch.ones_like(accept_ratio), accept_ratio)
+        rand_vals = torch.rand_like(accept_probs)
+
+        accepted = (rand_vals < accept_probs)
+        if greedy_mask.any():
+            target_tokens_greedy = torch.argmax(target_probs, dim=-1)
+            accepted_greedy = (draft_tokens == target_tokens_greedy)
+            accepted = torch.where(greedy_mask, accepted_greedy, accepted)
+
+        valid_tokens_mask = torch.cumprod(accepted, dim=1).bool()
+        num_accepted = valid_tokens_mask.sum(dim=1)
+
+        # sample next token
+        rejection_case_mask = (num_accepted < K)
+
+        safe_rejection_indices_vals = torch.clamp(num_accepted, max=K - 1)
+        rejection_indices = safe_rejection_indices_vals.view(B, 1, 1).expand(-1, -1, V)
+        target_dist_rejection = torch.gather(target_probs, 1, rejection_indices).squeeze(1)
+        draft_dist_rejection = torch.gather(draft_probs, 1, rejection_indices).squeeze(1)
+
+        adjusted_probs = torch.clamp(target_dist_rejection - draft_dist_rejection, min=0)
+
+        all_accepted_probs = probs[:, -1, :]
+
+        combined_probs = torch.where(rejection_case_mask.unsqueeze(-1), adjusted_probs, all_accepted_probs)
+
+        norm_sum = combined_probs.sum(dim=-1, keepdim=True)
+        final_next_probs = combined_probs / torch.clamp(norm_sum, min=epsilon)
+
+        final_token_ids = torch.multinomial(final_next_probs, num_samples=1).squeeze(-1)
+        if greedy_mask.any():
+            final_token_ids_greedy = torch.argmax(final_next_probs, dim=-1)
+            final_token_ids = torch.where(greedy_mask.squeeze(-1), final_token_ids_greedy, final_token_ids)
+
+        for i, seq in enumerate(seqs):
+            accepted_count = num_accepted[i].item()
+            seq.num_speculative_proposed_total += K
+            seq.num_speculative_accepted_total += accepted_count
+            seq.pending_accepted_tokens = draft_tokens[i, :accepted_count].tolist()
 
         reset_context()
-        return final_token_ids
+        return final_token_ids.tolist()
 
     @torch.inference_mode()
     def capture_cudagraph(self):

@@ -86,26 +86,15 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
-    def set_draft_tokens(self, draft_tokens: list[int], draft_probs: list[float]):
+    def set_draft_tokens(self, draft_tokens: list[int]):
         """Set draft tokens for speculative decoding."""
-        self.draft_tokens = draft_tokens
-        self.draft_probs = draft_probs
         for token in draft_tokens:
             self.append_token(token)
 
-    def reset_draft_tokens(self):
-        for token in self.draft_tokens[::-1]:
-            top_token = self.token_ids.pop()
-            assert top_token == token
-            self.num_tokens -= 1
+    def reset_draft_tokens(self, num_speculative_tokens: int):
+        self.token_ids = self.token_ids[:-num_speculative_tokens]
+        self.num_tokens -= num_speculative_tokens
         self.last_token = self.token_ids[-1]
-        self.draft_tokens = []
-        self.draft_probs = []
-
-    def clear_draft_tokens(self):
-        """Clear draft tokens after speculative decoding."""
-        self.draft_tokens = []
-        self.draft_probs = []
 
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table, self.num_processed_tokens, self.num_tokens_to_process,

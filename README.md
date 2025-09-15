@@ -60,18 +60,29 @@ python client.py --base-url http://localhost:8000 --message "Introduce yourself.
 See `bench.py` for benchmark.
 
 **Test Configuration:**
-- Hardware: RTX 4090 (24GB)
+- Hardware: RTX 4090 (48GB)
 - Model: Qwen3-1.7B
 - Total Requests: 256 sequences
-- Input Length(default): Randomly sampled between 100–1024 tokens
+- Input Length: Randomly sampled between 100–1024 tokens (default)
 - Output Length: Randomly sampled between 100–1024 tokens
+- max_model_len=2048 (default)
+- max_num_batched_tokens=4096 (default)
 - max_num_seqs=128
 
 **Performance results:**
-| | enable_chunked_prefill | input_length | max_model_len | max_num_batched_tokens |speculative_model | num_speculative_tokens | Output Tokens | Time (s) | Throughput (tokens/s) |
-|---|---|---|---|---|---|---|---|---|---|
-| | False | 100-1024 | 2048 | 4096   | None       | 0    | 133,966 | 31.56 | 4245.04 |
-| | True  | 100-1024 | 2048 | 4096   | None       | 0    | 133,966 | 33.16 | 4039.65 |
-| | False | 1025-1280 | 512 | 1024   | None       | 0    | - | - | - |
-| | True  | 1025-1280 | 512 | 1024   | None       | 0    | 149,755 | 55.15 | 2715.19 |
-| | False | 100-1024 | 2048 | 4096   | Qwen3-0.6B | 5    | 133,966 | 299.64 | 447.09 |
+| | enable_chunked_prefill | input_length | max_model_len | max_num_batched_tokens | Output Tokens | Time (s) | Throughput (tokens/s) |
+|---|---|---|---|---|---|---|---|
+| | False | 100-1024 | 2048 | 4096   | 133,966 | 28.87 | 4640.72 |
+| | True  | 100-1024 | 2048 | 4096   | 133,966 | 27.95 | 4793.67 |
+| | False | 1025-1280 | 512 | 1024   | - | - | - |
+| | True  | 1025-1280 | 512 | 1024   | 149,755 | 47.49 | 3153.68 |
+
+
+| | model | speculative_model | num_speculative_tokens | Output Tokens | Time (s) | Throughput (tokens/s) |
+|---|---|---|---|---|---|---|
+| | Qwen3-1.7B |  None       | 0    | 133,966 | 28.87  | 4640.72 |
+| | Qwen3-1.7B |  Qwen3-0.6B | 5    | 133,966 | 118.44 | 1131.06 |
+| | Qwen3-4B   |  None       | 0    | 133,966 | 47.33  | 2830.68 |
+| | Qwen3-4B   |  Qwen3-0.6B | 5    | 133,966 | 184.87 | 724.65 |
+| | Qwen3-8B   |  None       | 0    | 133,966 | 69.14  | 1937.69 |
+| | Qwen3-8B   |  Qwen3-0.6B | 5    | 133,966 | 268.22 | 499.47  |

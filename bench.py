@@ -12,12 +12,15 @@ def main():
     max_ouput_len = 1024
 
     path = os.path.expanduser("~/huggingface/Qwen3-1.7B/")
-    # speculative_path = None
-    # num_speculative_tokens = 0
-    speculative_path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    num_speculative_tokens = 5
+    if False:
+        speculative_path = None
+        num_speculative_tokens = 0
+    else:
+        speculative_path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+        num_speculative_tokens = 5
 
-    llm = LLM(path, enforce_eager=False,
+    llm = LLM(path,
+              enforce_eager=False,
               max_model_len=2048,
               max_num_seqs=128,
               max_num_batched_tokens=4096,

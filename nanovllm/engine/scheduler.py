@@ -155,7 +155,6 @@ class Scheduler:
                         is_reach_end = True
                         break
                 seq.pending_accepted_tokens.clear()
-                seq.clear_draft_tokens()
                 if is_reach_end:
                     continue
                 # append next token
