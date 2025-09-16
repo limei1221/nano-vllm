@@ -362,33 +362,19 @@ class ModelRunner:
             )  # (B, V)
 
             scaled = last_logits / safe_temps[:, None]
+            probs = torch.softmax(scaled, dim=-1)  # (B, V)
 
-            next_tokens = torch.empty((B,), dtype=torch.long, device=device)
+            sampled = torch.multinomial(probs, num_samples=1).squeeze(1)  # (B,)
+            argmax = torch.argmax(last_logits, dim=-1)                    # (B,)
+            next_tokens = torch.where(greedy_mask, argmax, sampled)       # (B,)
 
-            # 1) Sampling rows (temperature > 0)
-            sample_mask = ~greedy_mask
-            if sample_mask.any():
-                scaled_sample = scaled[sample_mask]                       # (B_s, V)
-                probs_sample = torch.softmax(scaled_sample, dim=-1)       # (B_s, V)
-                sampled = torch.multinomial(probs_sample, num_samples=1).squeeze(1)  # (B_s,)
-                next_tokens[sample_mask] = sampled
+            draft_tokens[:, t] = next_tokens
+            draft_probs[:, t] = probs
 
-                draft_probs[sample_mask, t] = probs_sample
-
-            # 2) Greedy rows (temperature == 0)
-            if greedy_mask.any():
-                logits_greedy = last_logits[greedy_mask]                  # (B_g, V)
-                probs_greedy = torch.softmax(logits_greedy, dim=-1)       # (B_g, V)
-                argmax = torch.argmax(logits_greedy, dim=-1)              # (B_g,)
-                next_tokens[greedy_mask] = argmax
-
-                draft_probs[greedy_mask, t] = probs_greedy
-
-            for i, token in enumerate(next_tokens.tolist()):
-                draft_tokens[i, t] = int(token)
-
+            for i in range(B):
+                token = int(next_tokens[i].item())
                 seq = seqs[i]
-                seq.append_token(int(token))
+                seq.append_token(token)
                 seq.draft_num_processed_tokens += seq.draft_num_tokens_to_process
                 seq.draft_num_tokens_to_process = 1
 
