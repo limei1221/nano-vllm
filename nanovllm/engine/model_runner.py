@@ -188,10 +188,12 @@ class ModelRunner:
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        if seqs[0].is_draft:
+            block_tables = [seq.draft_block_table + [-1] * (max_len - len(seq.draft_block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill(self, seqs: list[Sequence], is_draft: bool = False):
+    def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -201,20 +203,28 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
+            num_tokens_to_process = seq.num_tokens_to_process
+            num_processed_tokens = seq.num_processed_tokens
+            block_table = seq.block_table
+            if seq.is_draft:
+                num_tokens_to_process = seq.draft_num_tokens_to_process
+                num_processed_tokens = seq.draft_num_processed_tokens
+                block_table = seq.draft_block_table
+
             seqlen = len(seq)
             # Handle chunked prefill: only process specified number of tokens
-            if seq.num_tokens_to_process is not None:  # Chunked prefill or Speculative verify or generate draft tokens
-                tokens_to_process = min(seq.num_tokens_to_process, seqlen - seq.num_processed_tokens)
-                input_ids.extend(seq[seq.num_processed_tokens: seq.num_processed_tokens + tokens_to_process])
-                positions.extend(list(range(seq.num_processed_tokens, seq.num_processed_tokens + tokens_to_process)))
+            if num_tokens_to_process is not None:  # Chunked prefill or Speculative verify or generate draft tokens
+                tokens_to_process = min(num_tokens_to_process, seqlen - num_processed_tokens)
+                input_ids.extend(seq[num_processed_tokens: num_processed_tokens + tokens_to_process])
+                positions.extend(list(range(num_processed_tokens, num_processed_tokens + tokens_to_process)))
                 seqlen_q = tokens_to_process
-                seqlen_k = seq.num_processed_tokens + tokens_to_process
-                start_pos = seq.num_processed_tokens
-                if seq.block_table:
+                seqlen_k = num_processed_tokens + tokens_to_process
+                start_pos = num_processed_tokens
+                if block_table:
                     for pos in range(start_pos, start_pos + tokens_to_process):
                         block_idx = pos // self.block_size
                         offset_in_block = pos % self.block_size
-                        block_id = seq.block_table[block_idx]
+                        block_id = block_table[block_idx]
                         slot_mapping.append(block_id * self.block_size + offset_in_block)
             else:
                 input_ids.extend(seq[seq.num_cached_tokens:])
@@ -249,10 +259,14 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         for seq in seqs:
+            block_table = seq.block_table
+            if seq.is_draft:
+                block_table = seq.draft_block_table
+
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            slot_mapping.append(block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -301,67 +315,47 @@ class ModelRunner:
         return token_ids
 
     def run_speculative_decode(self, seqs: list[Sequence]) -> list[int]:
+        device = self.model.lm_head.weight.device
+        dtype = self.model.lm_head.weight.dtype
+
+        temps = torch.tensor([seq.temperature for seq in seqs], device=device, dtype=dtype)
+
         draft_tokens, draft_probs = self.generate_draft_tokens(
-                seqs, self.num_speculative_tokens
+                seqs, temps, device, dtype
             )
 
-        for i, seq in enumerate(seqs):
-            seq.is_speculative = True
-            seq.set_draft_tokens(draft_tokens[i])
-            seq.num_tokens_to_process = self.num_speculative_tokens + 1
+        final_token_ids = self.verify_draft_tokens(seqs, draft_tokens, draft_probs, temps)
 
-        final_token_ids = self.verify_draft_tokens(seqs, draft_tokens, draft_probs)
-
-        for i, seq in enumerate(seqs):
-            seq.reset_draft_tokens(self.num_speculative_tokens)
-
+        reset_context()
         return final_token_ids
 
     @torch.inference_mode()
     def generate_draft_tokens(
         self,
         seqs: list[Sequence],
-        max_new_tokens: int,
+        temps: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype
     ):
 
-        num_seqs = len(seqs)
+        B = len(seqs)
 
-        draft_seqs: list[Sequence] = []
         for seq in seqs:
-            working_ids = list(seq.token_ids)
-            sp = SamplingParams(
-                temperature=seq.temperature,
-                max_tokens=len(working_ids) + max_new_tokens,
-                ignore_eos=True,
-            )
-            draft_seq = Sequence(working_ids, sp)
-            draft_seq.block_table = seq.draft_block_table
+            seq.is_speculative = False
+            seq.is_draft = True
+            seq.draft_num_tokens_to_process = seq.num_tokens - seq.draft_num_processed_tokens
 
-            if seq.num_processed_tokens == seq.num_prompt_tokens:
-                draft_seq.num_processed_tokens = 0
-                draft_seq.num_tokens_to_process = draft_seq.num_tokens
-            else:
-                draft_seq.num_processed_tokens = seq.draft_num_processed_tokens
-                draft_seq.num_tokens_to_process = draft_seq.num_tokens - draft_seq.num_processed_tokens
+        draft_tokens = torch.empty((B, self.num_speculative_tokens), dtype=torch.int64, device=device)
+        draft_probs = torch.empty((B, self.num_speculative_tokens, self.vocab_size), dtype=dtype, device=device)
 
-            draft_seq.is_speculative = False
-            draft_seqs.append(draft_seq)
-
-        device = self.speculative_model.lm_head.weight.device
-        dtype = self.speculative_model.lm_head.weight.dtype
-
-        draft_tokens = torch.empty((num_seqs, max_new_tokens), dtype=torch.int64, device=device)
-        draft_probs = torch.empty((num_seqs, max_new_tokens, self.vocab_size), dtype=dtype, device=device)
-
-        temps = torch.tensor([ds.temperature for ds in draft_seqs], device=device, dtype=dtype)
         greedy_mask = temps == 0
         safe_temps = torch.where(greedy_mask, torch.ones_like(temps), temps)
 
-        for t in range(max_new_tokens):
+        for t in range(self.num_speculative_tokens):
             if t == 0:
-                input_ids, positions = self.prepare_prefill(draft_seqs)
+                input_ids, positions = self.prepare_prefill(seqs)
             else:
-                input_ids, positions = self.prepare_decode(draft_seqs)
+                input_ids, positions = self.prepare_decode(seqs)
 
             last_logits = self.speculative_model.compute_logits(
                 self.speculative_model(input_ids, positions)
@@ -369,7 +363,7 @@ class ModelRunner:
 
             scaled = last_logits / safe_temps[:, None]
 
-            next_tokens = torch.empty((num_seqs,), dtype=torch.long, device=device)
+            next_tokens = torch.empty((B,), dtype=torch.long, device=device)
 
             # 1) Sampling rows (temperature > 0)
             sample_mask = ~greedy_mask
@@ -379,9 +373,7 @@ class ModelRunner:
                 sampled = torch.multinomial(probs_sample, num_samples=1).squeeze(1)  # (B_s,)
                 next_tokens[sample_mask] = sampled
 
-                sample_indices = torch.nonzero(sample_mask, as_tuple=False).squeeze(1).tolist()
-                for j, seq_idx in enumerate(sample_indices):
-                    draft_probs[seq_idx, t] = probs_sample[j]
+                draft_probs[sample_mask, t] = probs_sample
 
             # 2) Greedy rows (temperature == 0)
             if greedy_mask.any():
@@ -390,43 +382,42 @@ class ModelRunner:
                 argmax = torch.argmax(logits_greedy, dim=-1)              # (B_g,)
                 next_tokens[greedy_mask] = argmax
 
-                greedy_indices = torch.nonzero(greedy_mask, as_tuple=False).squeeze(1).tolist()
-                for j, seq_idx in enumerate(greedy_indices):
-                    draft_probs[seq_idx, t] = probs_greedy[j]
+                draft_probs[greedy_mask, t] = probs_greedy
 
-            next_tokens_cpu = next_tokens.tolist()
-            for i, token in enumerate(next_tokens_cpu):
-                ds = draft_seqs[i]
+            for i, token in enumerate(next_tokens.tolist()):
                 draft_tokens[i, t] = int(token)
-                ds.num_processed_tokens += ds.num_tokens_to_process
-                ds.append_token(int(token))
-                ds.num_tokens_to_process = 1
 
-        reset_context()
+                seq = seqs[i]
+                seq.append_token(int(token))
+                seq.draft_num_processed_tokens += seq.draft_num_tokens_to_process
+                seq.draft_num_tokens_to_process = 1
 
-        del draft_seqs
         return draft_tokens, draft_probs
 
     @torch.inference_mode()
-    def verify_draft_tokens(self, seqs: list[Sequence], draft_tokens: list[list[int]], draft_probs: list[list[torch.Tensor]]) -> list[int]:
-        """
-        A refactored, vectorized implementation of speculative decoding verification.
-        This version uses a high-level if/else block to separate the "all-accepted"
-        fast path from the more complex "mixed-case" path.
-        """
-        # forward model
+    def verify_draft_tokens(
+        self,
+        seqs: list[Sequence],
+        draft_tokens: torch.Tensor,
+        draft_probs: torch.Tensor,
+        temps: torch.Tensor
+    ) -> list[int]:
+        B = len(seqs)
+        epsilon = 1e-8
+
+        for seq in seqs:
+            seq.is_speculative = True
+            seq.is_draft = False
+            seq.num_tokens_to_process = self.num_speculative_tokens + 1
+
         input_ids, positions = self.prepare_prefill(seqs)
         logits = self.run_model(input_ids, positions, True)
         logits = logits.reshape(len(seqs), -1, logits.size(-1))
         probs = torch.softmax(logits, dim=-1)
 
-        B, _, V = probs.shape
-        K = self.num_speculative_tokens
-        device = probs.device
-        epsilon = 1e-8
+        target_probs = probs[:, :self.num_speculative_tokens, :]
 
-        target_probs = probs[:, :K, :]
-        temps = torch.tensor([s.temperature for s in seqs], device=device).unsqueeze(-1)
+        temps = temps.unsqueeze(-1)
         greedy_mask = (temps == 0.0)
 
         # verify draft tokens
@@ -447,10 +438,10 @@ class ModelRunner:
         num_accepted = valid_tokens_mask.sum(dim=1)
 
         # sample next token
-        rejection_case_mask = (num_accepted < K)
+        rejection_case_mask = (num_accepted < self.num_speculative_tokens)
 
-        safe_rejection_indices_vals = torch.clamp(num_accepted, max=K - 1)
-        rejection_indices = safe_rejection_indices_vals.view(B, 1, 1).expand(-1, -1, V)
+        safe_rejection_indices_vals = torch.clamp(num_accepted, max=self.num_speculative_tokens - 1)
+        rejection_indices = safe_rejection_indices_vals.view(B, 1, 1).expand(-1, -1, self.vocab_size)
         target_dist_rejection = torch.gather(target_probs, 1, rejection_indices).squeeze(1)
         draft_dist_rejection = torch.gather(draft_probs, 1, rejection_indices).squeeze(1)
 
@@ -470,11 +461,11 @@ class ModelRunner:
 
         for i, seq in enumerate(seqs):
             accepted_count = num_accepted[i].item()
-            seq.num_speculative_proposed_total += K
+            seq.num_speculative_proposed_total += self.num_speculative_tokens
             seq.num_speculative_accepted_total += accepted_count
+            seq.reset_draft_tokens(self.num_speculative_tokens)
             seq.pending_accepted_tokens = draft_tokens[i, :accepted_count].tolist()
 
-        reset_context()
         return final_token_ids.tolist()
 
     @torch.inference_mode()

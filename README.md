@@ -81,8 +81,8 @@ See `bench.py` for benchmark.
 | | model | speculative_model | num_speculative_tokens | Output Tokens | Time (s) | Throughput (tokens/s) |
 |---|---|---|---|---|---|---|
 | | Qwen3-1.7B |  None       | 0    | 133,966 | 28.87  | 4640.72 |
-| | Qwen3-1.7B |  Qwen3-0.6B | 5    | 133,966 | 118.44 | 1131.06 |
+| | Qwen3-1.7B |  Qwen3-0.6B | 5    | 133,966 | 116.33 | 1151.57 |
 | | Qwen3-4B   |  None       | 0    | 133,966 | 47.33  | 2830.68 |
-| | Qwen3-4B   |  Qwen3-0.6B | 5    | 133,966 | 184.87 | 724.65 |
+| | Qwen3-4B   |  Qwen3-0.6B | 5    | 133,966 | 164.90 | 812.42  |
 | | Qwen3-8B   |  None       | 0    | 133,966 | 69.14  | 1937.69 |
-| | Qwen3-8B   |  Qwen3-0.6B | 5    | 133,966 | 268.22 | 499.47  |
+| | Qwen3-8B   |  Qwen3-0.6B | 5    | 133,966 | 212.48 | 630.50  |
