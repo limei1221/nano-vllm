@@ -375,25 +375,23 @@ class ModelRunner:
             return self.speculative_model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         if not is_prefill and self.speculative_decoding and self.rank == 0:
-            return self.run_speculative_decode(seqs)
+            return self.run_speculative_decode(seqs, temperatures)
 
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
         self.vocab_size = logits.size(-1)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
-    def run_speculative_decode(self, seqs: list[Sequence]) -> list[int]:
+    def run_speculative_decode(self, seqs: list[Sequence], temperatures: torch.Tensor) -> list[int]:
         device = self.model.lm_head.weight.device
         dtype = self.model.lm_head.weight.dtype
 
-        temps = torch.tensor([seq.temperature for seq in seqs], device=device, dtype=dtype)
-
-        draft_tokens, draft_probs = self.generate_draft_tokens(seqs, temps, device, dtype)
-        final_token_ids = self.verify_draft_tokens(seqs, draft_tokens, draft_probs, temps)
+        draft_tokens, draft_probs = self.generate_draft_tokens(seqs, temperatures, device, dtype)
+        final_token_ids = self.verify_draft_tokens(seqs, draft_tokens, draft_probs, temperatures)
 
         reset_context()
         return final_token_ids
