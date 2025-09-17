@@ -58,6 +58,7 @@ class ModelRunner:
             self.capture_cudagraph()
             if self.speculative_decoding:
                 self.capture_speculative_cudagraph()
+                self.capture_verify_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -80,6 +81,7 @@ class ModelRunner:
             del self.graphs, self.graph_pool
             if self.speculative_decoding:
                 del self.speculative_graphs, self.speculative_graph_pool
+                del self.verify_graphs, self.verify_graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -256,7 +258,7 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(seqs[0].is_speculative, self.num_speculative_tokens, True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(False, self.num_speculative_tokens, True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence], is_draft: bool = False):
@@ -278,7 +280,35 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(seqs[0].is_speculative, self.num_speculative_tokens, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(False, self.num_speculative_tokens, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        return input_ids, positions
+
+    def prepare_verify_decode(self, seqs: list[Sequence]):
+        # Build (B*(K+1)) tokens for decode verify: last normal token + K draft tokens per seq
+        input_ids: list[int] = []
+        positions: list[int] = []
+        slot_mapping: list[int] = []
+        context_lens: list[int] = []
+        K = self.num_speculative_tokens
+        for seq in seqs:
+            block_table = seq.block_table
+            start_idx = max(0, len(seq) - K - 1)
+            end_idx = len(seq) - 1
+            input_ids.extend(seq[start_idx: end_idx + 1])
+            positions.extend(list(range(start_idx, end_idx + 1)))
+            for pos in range(start_idx, end_idx + 1):
+                block_idx = pos // self.block_size
+                offset_in_block = pos % self.block_size
+                block_id = block_table[block_idx]
+                slot_mapping.append(block_id * self.block_size + offset_in_block)
+            context_lens.append(len(seq))
+
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        set_context(True, self.num_speculative_tokens, False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -295,16 +325,32 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            for k, v in graph_vars.items():
-                if k != "outputs":
-                    v.zero_()
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            if context.is_speculative:
+                K1 = self.num_speculative_tokens + 1
+                assert bs % K1 == 0, "Speculative verify expects (batch_size * (K+1)) tokens"
+                B = bs // K1
+                graph = self.verify_graphs[next(x for x in self.graph_bs if x >= B)]
+                graph_vars = self.verify_graph_vars
+                for k, v in graph_vars.items():
+                    if k != "outputs":
+                        v.zero_()
+                graph_vars["input_ids"][:bs] = input_ids
+                graph_vars["positions"][:bs] = positions
+                graph_vars["slot_mapping"][:bs] = context.slot_mapping
+                graph_vars["context_lens"][:B] = context.context_lens
+                graph_vars["block_tables"][:B, :context.block_tables.size(1)] = context.block_tables
+            else:
+                graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+                graph_vars = self.graph_vars
+                for k, v in graph_vars.items():
+                    if k != "outputs":
+                        v.zero_()
+                graph_vars["input_ids"][:bs] = input_ids
+                graph_vars["positions"][:bs] = positions
+                graph_vars["slot_mapping"][:bs] = context.slot_mapping
+                graph_vars["context_lens"][:bs] = context.context_lens
+                graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -345,14 +391,9 @@ class ModelRunner:
         dtype = self.model.lm_head.weight.dtype
 
         temps = torch.tensor([seq.temperature for seq in seqs], device=device, dtype=dtype)
-        greedy_mask = (temps == 0.0)
-        safe_temps = torch.where(greedy_mask, torch.ones_like(temps), temps)
 
-        draft_tokens, draft_probs = self.generate_draft_tokens(
-                seqs, greedy_mask, safe_temps, device, dtype
-            )
-
-        final_token_ids = self.verify_draft_tokens(seqs, draft_tokens, draft_probs, greedy_mask, safe_temps)
+        draft_tokens, draft_probs = self.generate_draft_tokens(seqs, temps, device, dtype)
+        final_token_ids = self.verify_draft_tokens(seqs, draft_tokens, draft_probs, temps)
 
         reset_context()
         return final_token_ids
@@ -361,8 +402,7 @@ class ModelRunner:
     def generate_draft_tokens(
         self,
         seqs: list[Sequence],
-        greedy_mask: torch.Tensor,
-        safe_temps: torch.Tensor,
+        temps: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype
     ):
@@ -382,16 +422,10 @@ class ModelRunner:
                 input_ids, positions = self.prepare_decode(seqs)
                 last_logits = self.run_speculative_model(input_ids, positions, False)
 
-            scaled = last_logits / safe_temps.unsqueeze(-1)
-            probs = torch.softmax(scaled, dim=-1)  # (B, V)
+            next_tokens, probs = self.sampler(last_logits, temps, return_probs=True)
 
-            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)  # (B,)
-            if greedy_mask.any():
-                next_tokens_greedy = torch.argmax(last_logits, dim=-1)
-                next_tokens = torch.where(greedy_mask, next_tokens_greedy, next_tokens)
-
-            draft_tokens[:, t] = next_tokens
-            draft_probs[:, t] = probs
+            draft_tokens[:, t] = next_tokens  # (B,)
+            draft_probs[:, t] = probs  # (B, V)
 
             for i, seq in enumerate(seqs):
                 token = int(next_tokens[i].item())
@@ -407,19 +441,18 @@ class ModelRunner:
         seqs: list[Sequence],
         draft_tokens: torch.Tensor,
         draft_probs: torch.Tensor,
-        greedy_mask: torch.Tensor,
-        safe_temps: torch.Tensor
+        temps: torch.Tensor
     ) -> list[int]:
         for seq in seqs:
             seq.is_speculative = True
             seq.is_draft = False
             seq.num_tokens_to_process = self.num_speculative_tokens + 1
 
-        input_ids, positions = self.prepare_prefill(seqs)
-        logits = self.run_model(input_ids, positions, True)
-        logits = logits.reshape(len(seqs), -1, logits.size(-1))  # (B, K + 1, V)
-        scaled = logits / safe_temps.unsqueeze(-1).unsqueeze(-1)
-        probs = torch.softmax(scaled, dim=-1)
+        input_ids, positions = self.prepare_verify_decode(seqs)
+        logits = self.run_model(input_ids, positions, False)
+        temps_reshaped = temps.repeat_interleave(self.num_speculative_tokens + 1)
+        _, probs = self.sampler(logits, temps_reshaped, return_probs=True)
+        probs = probs.reshape(len(seqs), -1, probs.size(-1))  # (B, K + 1, V)s
         target_probs = probs[:, :self.num_speculative_tokens, :]  # (B, K, V)
 
         # verify draft tokens
@@ -431,6 +464,7 @@ class ModelRunner:
         rand_vals = torch.rand_like(accept_probs)
 
         accepted = (rand_vals < accept_probs)  # (B, K)
+        greedy_mask = (temps == 0.0)
         if greedy_mask.any():
             target_tokens_greedy = torch.argmax(target_probs, dim=-1)
             accepted_greedy = (draft_tokens == target_tokens_greedy)
@@ -454,10 +488,7 @@ class ModelRunner:
         norm_sum = combined_probs.sum(dim=-1, keepdim=True)
         final_next_probs = combined_probs / torch.clamp(norm_sum, min=EPSILON)
 
-        final_token_ids = torch.multinomial(final_next_probs, num_samples=1).squeeze(-1)
-        if greedy_mask.any():
-            final_token_ids_greedy = torch.argmax(final_next_probs, dim=-1)
-            final_token_ids = torch.where(greedy_mask, final_token_ids_greedy, final_token_ids)
+        final_token_ids = self.sampler(final_next_probs, temps)
 
         for i, seq in enumerate(seqs):
             accepted_count = num_accepted[i].item()
@@ -533,6 +564,49 @@ class ModelRunner:
             reset_context()
 
         self.speculative_graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            outputs=outputs,
+        )
+
+    @torch.inference_mode()
+    def capture_verify_cudagraph(self):
+        # Capture graphs for target model in speculative verify decode path (K+1 tokens per seq)
+        config = self.config
+        hf_config = config.hf_config
+        max_B = min(self.config.max_num_seqs, 512)
+        K1 = self.num_speculative_tokens + 1
+        max_tokens = max_B * K1
+        max_num_blocks = config.num_kvcache_blocks
+        input_ids = torch.zeros(max_tokens, dtype=torch.int64)
+        positions = torch.zeros(max_tokens, dtype=torch.int64)
+        slot_mapping = torch.zeros(max_tokens, dtype=torch.int32)
+        context_lens = torch.zeros(max_B, dtype=torch.int32)
+        block_tables = torch.zeros(max_B, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(max_tokens, hf_config.hidden_size)
+        self.verify_graphs = {}
+        self.verify_graph_pool = None
+
+        for B in reversed(self.graph_bs):
+            if B > max_B:
+                continue
+            graph = torch.cuda.CUDAGraph()
+            n = B * K1
+            set_context(True, self.num_speculative_tokens, False,
+                        slot_mapping=slot_mapping[:n], context_lens=context_lens[:B], block_tables=block_tables[:B])
+            outputs[:n] = self.model(input_ids[:n], positions[:n])  # warmup
+            with torch.cuda.graph(graph, self.verify_graph_pool):
+                outputs[:n] = self.model(input_ids[:n], positions[:n])  # capture
+            if self.verify_graph_pool is None:
+                self.verify_graph_pool = graph.pool()
+            self.verify_graphs[B] = graph
+            torch.cuda.synchronize()
+            reset_context()
+
+        self.verify_graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
             slot_mapping=slot_mapping,
