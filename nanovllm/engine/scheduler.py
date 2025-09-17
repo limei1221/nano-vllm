@@ -139,30 +139,40 @@ class Scheduler:
 
         for seq, token_id in zip(seqs, token_ids):
             if seq.is_speculative:  # Speculative decoding
-                seq.num_processed_tokens += 1 + len(seq.pending_accepted_tokens)
-                if len(seq.pending_accepted_tokens) < self.num_speculative_tokens:
-                    seq.draft_num_processed_tokens = seq.num_processed_tokens
-                else:  # the last draft token is not processed by draft model
-                    seq.draft_num_processed_tokens = seq.num_processed_tokens - 1
-                is_reach_end = False
-                for token in seq.pending_accepted_tokens:
-                    seq.append_token(token)
-                    if reach_end(seq, token):
+                accepted_count = len(seq.pending_accepted_tokens)
+                if accepted_count > 0:
+                    end_index = -1
+                    for i, t in enumerate(seq.pending_accepted_tokens):
+                        if (not seq.ignore_eos and t == self.eos) or (seq.num_completion_tokens - self.num_speculative_tokens + i + 1 == seq.max_tokens):
+                            end_index = i
+                            break
+                    if end_index != -1:
+                        tokens_to_pop = self.num_speculative_tokens - (end_index + 1)
+                        if tokens_to_pop > 0:
+                            seq.pop_last_n_tokens(tokens_to_pop)
+                        seq.pending_accepted_tokens.clear()
                         seq.status = SequenceStatus.FINISHED
                         self.block_manager.deallocate(seq)
                         if seq in self.running:
                             self.running.remove(seq)
-                        is_reach_end = True
-                        break
+                        continue
+
+                seq.num_processed_tokens += 1 + accepted_count
+                if accepted_count < self.num_speculative_tokens:
+                    to_pop = self.num_speculative_tokens - accepted_count
+                    seq.pop_last_n_tokens(to_pop)
+                    seq.draft_num_processed_tokens = seq.num_processed_tokens
+                else:  # the last draft token is not processed by draft model
+                    seq.draft_num_processed_tokens = seq.num_processed_tokens - 1
                 seq.pending_accepted_tokens.clear()
-                if is_reach_end:
-                    continue
+
                 # append next token
                 seq.append_token(token_id)
                 if reach_end(seq, token_id):
                     seq.status = SequenceStatus.FINISHED
                     self.block_manager.deallocate(seq)
-                    self.running.remove(seq)
+                    if seq in self.running:
+                        self.running.remove(seq)
                 seq.is_speculative = False
             elif seq.num_tokens_to_process is not None:  # Prefill phase
                 seq.num_processed_tokens += seq.num_tokens_to_process

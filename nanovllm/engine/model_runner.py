@@ -463,7 +463,6 @@ class ModelRunner:
             accepted_count = num_accepted[i].item()
             seq.num_speculative_proposed_total += self.num_speculative_tokens
             seq.num_speculative_accepted_total += accepted_count
-            seq.reset_draft_tokens(self.num_speculative_tokens)
             seq.pending_accepted_tokens = draft_tokens[i, :accepted_count].tolist()
 
         return final_token_ids.tolist()

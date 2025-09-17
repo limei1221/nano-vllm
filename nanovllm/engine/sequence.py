@@ -86,9 +86,13 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
-    def reset_draft_tokens(self, num_speculative_tokens: int):
-        self.token_ids = self.token_ids[:-num_speculative_tokens]
-        self.num_tokens -= num_speculative_tokens
+    def pop_last_n_tokens(self, n: int):
+        if n <= 0:
+            return
+        if n >= self.num_tokens - 1:
+            n = self.num_tokens - 1
+        del self.token_ids[-n:]
+        self.num_tokens -= n
         self.last_token = self.token_ids[-1]
 
     def __getstate__(self):
