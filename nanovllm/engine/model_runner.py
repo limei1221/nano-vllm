@@ -54,6 +54,8 @@ class ModelRunner:
         self.allocate_kv_cache()  # allocate kv cache for self.model
         if not self.enforce_eager:
             self.capture_cudagraph()
+            if self.speculative_decoding:
+                self.capture_speculative_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -74,6 +76,8 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
+            if self.speculative_decoding:
+                del self.speculative_graphs, self.speculative_graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -187,9 +191,10 @@ class ModelRunner:
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         if seqs[0].is_draft:
             block_tables = [seq.draft_block_table + [-1] * (max_len - len(seq.draft_block_table)) for seq in seqs]
+        else:
+            block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
@@ -203,25 +208,24 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
-            num_tokens_to_process = seq.num_tokens_to_process
-            num_processed_tokens = seq.num_processed_tokens
-            block_table = seq.block_table
             if seq.is_draft:
                 num_tokens_to_process = seq.draft_num_tokens_to_process
                 num_processed_tokens = seq.draft_num_processed_tokens
                 block_table = seq.draft_block_table
-
+            else:
+                num_tokens_to_process = seq.num_tokens_to_process
+                num_processed_tokens = seq.num_processed_tokens
+                block_table = seq.block_table
             seqlen = len(seq)
             # Handle chunked prefill: only process specified number of tokens
             if num_tokens_to_process is not None:  # Chunked prefill or Speculative verify or generate draft tokens
-                tokens_to_process = min(num_tokens_to_process, seqlen - num_processed_tokens)
-                input_ids.extend(seq[num_processed_tokens: num_processed_tokens + tokens_to_process])
-                positions.extend(list(range(num_processed_tokens, num_processed_tokens + tokens_to_process)))
-                seqlen_q = tokens_to_process
-                seqlen_k = num_processed_tokens + tokens_to_process
+                input_ids.extend(seq[num_processed_tokens: num_processed_tokens + num_tokens_to_process])
+                positions.extend(list(range(num_processed_tokens, num_processed_tokens + num_tokens_to_process)))
+                seqlen_q = num_tokens_to_process
+                seqlen_k = num_processed_tokens + num_tokens_to_process
                 start_pos = num_processed_tokens
                 if block_table:
-                    for pos in range(start_pos, start_pos + tokens_to_process):
+                    for pos in range(start_pos, start_pos + num_tokens_to_process):
                         block_idx = pos // self.block_size
                         offset_in_block = pos % self.block_size
                         block_id = block_table[block_idx]
@@ -259,10 +263,10 @@ class ModelRunner:
         slot_mapping = []
         context_lens = []
         for seq in seqs:
-            block_table = seq.block_table
             if seq.is_draft:
                 block_table = seq.draft_block_table
-
+            else:
+                block_table = seq.block_table
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
@@ -301,6 +305,26 @@ class ModelRunner:
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
+
+    @torch.inference_mode()
+    def run_speculative_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            return self.speculative_model.compute_logits(self.speculative_model(input_ids, positions))
+        else:
+            bs = input_ids.size(0)
+            context = get_context()
+            graph = self.speculative_graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph_vars = self.speculative_graph_vars
+            for k, v in graph_vars.items():
+                if k != "outputs":
+                    v.zero_()
+            graph_vars["input_ids"][:bs] = input_ids
+            graph_vars["positions"][:bs] = positions
+            graph_vars["slot_mapping"][:bs] = context.slot_mapping
+            graph_vars["context_lens"][:bs] = context.context_lens
+            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            graph.replay()
+            return self.speculative_model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         if not is_prefill and self.speculative_decoding and self.rank == 0:
@@ -354,12 +378,10 @@ class ModelRunner:
         for t in range(self.num_speculative_tokens):
             if t == 0:
                 input_ids, positions = self.prepare_prefill(seqs)
+                last_logits = self.run_speculative_model(input_ids, positions, True)
             else:
                 input_ids, positions = self.prepare_decode(seqs)
-
-            last_logits = self.speculative_model.compute_logits(
-                self.speculative_model(input_ids, positions)
-            )  # (B, V)
+                last_logits = self.run_speculative_model(input_ids, positions, False)
 
             scaled = last_logits / safe_temps[:, None]
             probs = torch.softmax(scaled, dim=-1)  # (B, V)
@@ -483,6 +505,43 @@ class ModelRunner:
             reset_context()
 
         self.graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            outputs=outputs,
+        )
+
+    @torch.inference_mode()
+    def capture_speculative_cudagraph(self):
+        config = self.config
+        hf_config = self.speculative_model_hf_config
+        max_bs = min(self.config.max_num_seqs, 512)
+        max_num_blocks = config.num_kvcache_blocks
+        input_ids = torch.zeros(max_bs, dtype=torch.int64)
+        positions = torch.zeros(max_bs, dtype=torch.int64)
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.speculative_graphs = {}
+        self.speculative_graph_pool = None
+
+        for bs in reversed(self.graph_bs):
+            graph = torch.cuda.CUDAGraph()
+            set_context(False, self.num_speculative_tokens, False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            outputs[:bs] = self.speculative_model(input_ids[:bs], positions[:bs])    # warmup
+            with torch.cuda.graph(graph, self.speculative_graph_pool):
+                outputs[:bs] = self.speculative_model(input_ids[:bs], positions[:bs])    # capture
+            if self.speculative_graph_pool is None:
+                self.speculative_graph_pool = graph.pool()
+            self.speculative_graphs[bs] = graph
+            torch.cuda.synchronize()
+            reset_context()
+
+        self.speculative_graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
             slot_mapping=slot_mapping,
