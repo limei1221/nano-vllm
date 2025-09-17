@@ -70,7 +70,7 @@ See `bench.py` for benchmark.
 - max_num_seqs=128
 
 **Performance results:**
-temperature=0.6, ignore_eos=True
+temperature=0.6
 | | enable_chunked_prefill | input_length | max_model_len | max_num_batched_tokens | Output Tokens | Time (s) | Throughput (tokens/s) |
 |---|---|---|---|---|---|---|---|
 | | False | 100-1024 | 2048 | 4096   | 133,966 | 28.87 | 4640.72 |
@@ -79,15 +79,15 @@ temperature=0.6, ignore_eos=True
 | | True  | 1025-1280 | 512 | 1024   | 149,755 | 47.49 | 3153.68 |
 
 
-temperature=0.0, ignore_eos=True
+temperature=0.0
 | | model | speculative_model | num_speculative_tokens | Output Tokens | Time (s) | Throughput (tokens/s) |
 |---|---|---|---|---|---|---|
-| | Qwen3-1.7B |  None       | 0    | 133,966 | 28.63  | 4678.75 |
-| | Qwen3-1.7B |  Qwen3-0.6B | 3    | 133,966 | 46.94  | 2854.17 |
-| | Qwen3-1.7B |  Qwen3-0.6B | 5    | 133,966 | 46.41  | 2886.68 |
-| | Qwen3-4B   |  None       | 0    | 133,966 | 47.34  | 2829.99 |
-| | Qwen3-4B   |  Qwen3-0.6B | 3    | 133,966 | 83.92  | 1596.29 |
-| | Qwen3-4B   |  Qwen3-0.6B | 5    | 133,966 | 99.00  | 1353.25 |
-| | Qwen3-8B   |  None       | 0    | 133,966 | 69.08  | 1939.18 |
-| | Qwen3-8B   |  Qwen3-0.6B | 3    | 133,966 | 108.77 | 1231.67 |
-| | Qwen3-8B   |  Qwen3-0.6B | 5    | 133,966 | 106.77 | 1254.73 |
+| | Qwen3-1.7B |  None       | 0    | 133,966 | 28.38  | 4720.47 |
+| | Qwen3-1.7B |  Qwen3-0.6B | 3    | 133,966 | 46.65  | 2871.50 |
+| | Qwen3-1.7B |  Qwen3-0.6B | 5    | 133,966 | 44.05  | 3041.23 |
+| | Qwen3-4B   |  None       | 0    | 133,966 | 46.99  | 2851.16 |
+| | Qwen3-4B   |  Qwen3-0.6B | 3    | 133,966 | 82.84  | 1617.15 |
+| | Qwen3-4B   |  Qwen3-0.6B | 5    | 133,966 | 75.36  | 1777.65 |
+| | Qwen3-8B   |  None       | 0    | 133,966 | 68.75  | 1948.51 |
+| | Qwen3-8B   |  Qwen3-0.6B | 3    | 133,966 | 107.29 | 1248.61 |
+| | Qwen3-8B   |  Qwen3-0.6B | 5    | 133,966 | 118.47 | 1130.80 |

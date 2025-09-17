@@ -1,8 +1,6 @@
 import pickle
 import torch
 import torch.distributed as dist
-from torch.distributions import Categorical
-import torch.nn.functional as F
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 from transformers import AutoTokenizer, AutoConfig
@@ -18,7 +16,6 @@ from nanovllm.sampling_params import SamplingParams
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
-EPSILON = 1e-8
 
 class ModelRunner:
 
@@ -346,7 +343,7 @@ class ModelRunner:
                 graph_vars = self.graph_vars
                 for k, v in graph_vars.items():
                     if k != "outputs":
-                        v[bs:].zero_()
+                        v.zero_()
                 graph_vars["input_ids"][:bs] = input_ids
                 graph_vars["positions"][:bs] = positions
                 graph_vars["slot_mapping"][:bs] = context.slot_mapping
@@ -367,7 +364,7 @@ class ModelRunner:
             graph_vars = self.speculative_graph_vars
             for k, v in graph_vars.items():
                 if k != "outputs":
-                    v[bs:].zero_()
+                    v.zero_()
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
@@ -459,7 +456,7 @@ class ModelRunner:
         indices = draft_tokens.unsqueeze(-1)  # (B, K, 1)
         draft_token_probs_from_draft = torch.gather(draft_probs, 2, indices).squeeze(-1)  # (B, K)
         draft_token_probs_from_target = torch.gather(target_probs, 2, indices).squeeze(-1)
-        accept_ratio = draft_token_probs_from_target / (draft_token_probs_from_draft + EPSILON)
+        accept_ratio = torch.exp(torch.log(draft_token_probs_from_target) - torch.log(draft_token_probs_from_draft))
         accept_probs = torch.min(torch.ones_like(accept_ratio), accept_ratio)
 
         accepted = (torch.rand_like(accept_probs) < accept_probs)  # (B, K)
@@ -475,7 +472,7 @@ class ModelRunner:
 
             adjusted_probs = torch.clamp(target_dist_at_rejection - draft_dist_at_rejection, min=0)  # (B, V)
             norm_sum = adjusted_probs.sum(dim=-1, keepdim=True)
-            adjusted_probs = adjusted_probs / torch.clamp(norm_sum, min=EPSILON)
+            adjusted_probs = adjusted_probs / torch.clamp(norm_sum, min=1e-8)
 
             all_accepted_mask = (num_accepted == self.num_speculative_tokens)  # (B,)
             last_probs = probs[:, -1, :]  # (B, V)
@@ -498,7 +495,7 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = config.num_kvcache_blocks
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
@@ -535,7 +532,7 @@ class ModelRunner:
         config = self.config
         hf_config = self.speculative_model_hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = config.num_kvcache_blocks
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
@@ -575,7 +572,7 @@ class ModelRunner:
         max_B = min(self.config.max_num_seqs, 512)
         K1 = self.num_speculative_tokens + 1
         max_tokens = max_B * K1
-        max_num_blocks = config.num_kvcache_blocks
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_tokens, dtype=torch.int64)
         positions = torch.zeros(max_tokens, dtype=torch.int64)
         slot_mapping = torch.zeros(max_tokens, dtype=torch.int32)
