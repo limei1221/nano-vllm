@@ -7,6 +7,13 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
 
+    def compute_temperature_scaled_probs(self, logits: torch.Tensor, temperatures: torch.Tensor):
+        logits = logits.to(torch.float)
+        safe_temperatures = torch.where(temperatures == 0, torch.ones_like(temperatures), temperatures)
+        logits.div_(safe_temperatures.unsqueeze(dim=1))
+        probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+        return probs
+
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor, return_probs: bool = False):
         logits = logits.to(torch.float)
         greedy_tokens = logits.argmax(dim=-1)

@@ -15,6 +15,8 @@ from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.sampling_params import SamplingParams
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
 
 EPSILON = 1e-8
 
@@ -344,7 +346,7 @@ class ModelRunner:
                 graph_vars = self.graph_vars
                 for k, v in graph_vars.items():
                     if k != "outputs":
-                        v.zero_()
+                        v[bs:].zero_()
                 graph_vars["input_ids"][:bs] = input_ids
                 graph_vars["positions"][:bs] = positions
                 graph_vars["slot_mapping"][:bs] = context.slot_mapping
@@ -365,7 +367,7 @@ class ModelRunner:
             graph_vars = self.speculative_graph_vars
             for k, v in graph_vars.items():
                 if k != "outputs":
-                    v.zero_()
+                    v[bs:].zero_()
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
@@ -449,8 +451,8 @@ class ModelRunner:
         input_ids, positions = self.prepare_verify_decode(seqs)
         logits = self.run_model(input_ids, positions, False)
         temps_reshaped = temps.repeat_interleave(self.num_speculative_tokens + 1)
-        _, probs = self.sampler(logits, temps_reshaped, return_probs=True)
-        probs = probs.reshape(len(seqs), -1, probs.size(-1))  # (B, K + 1, V)s
+        probs = self.sampler.compute_temperature_scaled_probs(logits, temps_reshaped)
+        probs = probs.reshape(len(seqs), -1, probs.size(-1))  # (B, K + 1, V)
         target_probs = probs[:, :self.num_speculative_tokens, :]  # (B, K, V)
 
         # verify draft tokens
@@ -459,32 +461,27 @@ class ModelRunner:
         draft_token_probs_from_target = torch.gather(target_probs, 2, indices).squeeze(-1)
         accept_ratio = draft_token_probs_from_target / (draft_token_probs_from_draft + EPSILON)
         accept_probs = torch.min(torch.ones_like(accept_ratio), accept_ratio)
-        rand_vals = torch.rand_like(accept_probs)
 
-        accepted = (rand_vals < accept_probs)  # (B, K)
-        greedy_mask = (temps == 0.0)
-        if greedy_mask.any():
-            target_tokens_greedy = torch.argmax(target_probs, dim=-1)
-            accepted_greedy = (draft_tokens == target_tokens_greedy)
-            accepted = torch.where(greedy_mask.unsqueeze(-1), accepted_greedy, accepted)
-
+        accepted = (torch.rand_like(accept_probs) < accept_probs)  # (B, K)
         valid_tokens_mask = torch.cumprod(accepted, dim=1).bool()  # (B, K)
         num_accepted = valid_tokens_mask.sum(dim=1)  # (B,)
 
-        # sample next token
-        rejection_case_mask = (num_accepted < self.num_speculative_tokens)  # (B,)
+        if (num_accepted < self.num_speculative_tokens).any():
+            rejection_positions = torch.clamp(num_accepted, max=self.num_speculative_tokens - 1)  # (B,)
 
-        safe_rejection_indices_vals = torch.clamp(num_accepted, max=self.num_speculative_tokens - 1)
-        rejection_indices = safe_rejection_indices_vals.view(len(seqs), 1, 1).expand(-1, -1, self.vocab_size)  # (B, 1, V)
-        target_dist_rejection = torch.gather(target_probs, 1, rejection_indices).squeeze(1)  # (B, V)
-        draft_dist_rejection = torch.gather(draft_probs, 1, rejection_indices).squeeze(1)
+            batch_indices = torch.arange(len(seqs), device=rejection_positions.device)  # (B,)
+            target_dist_at_rejection = target_probs[batch_indices, rejection_positions]  # (B, V)
+            draft_dist_at_rejection = draft_probs[batch_indices, rejection_positions]  # (B, V)
 
-        adjusted_probs = torch.clamp(target_dist_rejection - draft_dist_rejection, min=0)  # (B, V)
-        last_probs = probs[:, -1, :]
-        combined_probs = torch.where(rejection_case_mask.unsqueeze(-1), adjusted_probs, last_probs)
+            adjusted_probs = torch.clamp(target_dist_at_rejection - draft_dist_at_rejection, min=0)  # (B, V)
+            norm_sum = adjusted_probs.sum(dim=-1, keepdim=True)
+            adjusted_probs = adjusted_probs / torch.clamp(norm_sum, min=EPSILON)
 
-        norm_sum = combined_probs.sum(dim=-1, keepdim=True)
-        final_next_probs = combined_probs / torch.clamp(norm_sum, min=EPSILON)
+            all_accepted_mask = (num_accepted == self.num_speculative_tokens)  # (B,)
+            last_probs = probs[:, -1, :]  # (B, V)
+            final_next_probs = torch.where(all_accepted_mask.unsqueeze(-1), last_probs, adjusted_probs)
+        else:
+            final_next_probs = probs[:, -1, :]
 
         final_token_ids = self.sampler(final_next_probs, temps)
 

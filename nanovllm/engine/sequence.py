@@ -32,7 +32,7 @@ class Sequence:
 
         # Speculative decoding fields
         self.is_speculative = False  # Whether this sequence is doing verify step of speculative decoding
-        self.pending_accepted_tokens: list[int] = []
+        self.pending_accepted_tokens = []
 
         self.is_draft = False  # Whether this sequence is doing propose step by draft model
         self.draft_block_table = []
@@ -40,8 +40,8 @@ class Sequence:
         self.draft_num_tokens_to_process = 0
 
         # Speculative decoding metrics, sequence level
-        self.num_speculative_proposed_total: int = 0
-        self.num_speculative_accepted_total: int = 0
+        self.num_speculative_proposed_total = 0
+        self.num_speculative_accepted_total = 0
 
     def __len__(self):
         return self.num_tokens
