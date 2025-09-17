@@ -16,6 +16,8 @@ from nanovllm.utils.loader import load_model
 from nanovllm.sampling_params import SamplingParams
 
 
+EPSILON = 1e-8
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -343,12 +345,14 @@ class ModelRunner:
         dtype = self.model.lm_head.weight.dtype
 
         temps = torch.tensor([seq.temperature for seq in seqs], device=device, dtype=dtype)
+        greedy_mask = (temps == 0.0)
+        safe_temps = torch.where(greedy_mask, torch.ones_like(temps), temps)
 
         draft_tokens, draft_probs = self.generate_draft_tokens(
-                seqs, temps, device, dtype
+                seqs, greedy_mask, safe_temps, device, dtype
             )
 
-        final_token_ids = self.verify_draft_tokens(seqs, draft_tokens, draft_probs, temps)
+        final_token_ids = self.verify_draft_tokens(seqs, draft_tokens, draft_probs, greedy_mask, safe_temps)
 
         reset_context()
         return final_token_ids
@@ -357,23 +361,18 @@ class ModelRunner:
     def generate_draft_tokens(
         self,
         seqs: list[Sequence],
-        temps: torch.Tensor,
+        greedy_mask: torch.Tensor,
+        safe_temps: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype
     ):
-
-        B = len(seqs)
-
         for seq in seqs:
             seq.is_speculative = False
             seq.is_draft = True
             seq.draft_num_tokens_to_process = seq.num_tokens - seq.draft_num_processed_tokens
 
-        draft_tokens = torch.empty((B, self.num_speculative_tokens), dtype=torch.int64, device=device)
-        draft_probs = torch.empty((B, self.num_speculative_tokens, self.vocab_size), dtype=dtype, device=device)
-
-        greedy_mask = temps == 0
-        safe_temps = torch.where(greedy_mask, torch.ones_like(temps), temps)
+        draft_tokens = torch.empty((len(seqs), self.num_speculative_tokens), dtype=torch.int64, device=device)
+        draft_probs = torch.empty((len(seqs), self.num_speculative_tokens, self.vocab_size), dtype=dtype, device=device)
 
         for t in range(self.num_speculative_tokens):
             if t == 0:
@@ -383,19 +382,19 @@ class ModelRunner:
                 input_ids, positions = self.prepare_decode(seqs)
                 last_logits = self.run_speculative_model(input_ids, positions, False)
 
-            scaled = last_logits / safe_temps[:, None]
+            scaled = last_logits / safe_temps.unsqueeze(-1)
             probs = torch.softmax(scaled, dim=-1)  # (B, V)
 
-            sampled = torch.multinomial(probs, num_samples=1).squeeze(1)  # (B,)
-            argmax = torch.argmax(last_logits, dim=-1)                    # (B,)
-            next_tokens = torch.where(greedy_mask, argmax, sampled)       # (B,)
+            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)  # (B,)
+            if greedy_mask.any():
+                next_tokens_greedy = torch.argmax(last_logits, dim=-1)
+                next_tokens = torch.where(greedy_mask, next_tokens_greedy, next_tokens)
 
             draft_tokens[:, t] = next_tokens
             draft_probs[:, t] = probs
 
-            for i in range(B):
+            for i, seq in enumerate(seqs):
                 token = int(next_tokens[i].item())
-                seq = seqs[i]
                 seq.append_token(token)
                 seq.draft_num_processed_tokens += seq.draft_num_tokens_to_process
                 seq.draft_num_tokens_to_process = 1
@@ -408,11 +407,9 @@ class ModelRunner:
         seqs: list[Sequence],
         draft_tokens: torch.Tensor,
         draft_probs: torch.Tensor,
-        temps: torch.Tensor
+        greedy_mask: torch.Tensor,
+        safe_temps: torch.Tensor
     ) -> list[int]:
-        B = len(seqs)
-        epsilon = 1e-8
-
         for seq in seqs:
             seq.is_speculative = True
             seq.is_draft = False
@@ -420,52 +417,47 @@ class ModelRunner:
 
         input_ids, positions = self.prepare_prefill(seqs)
         logits = self.run_model(input_ids, positions, True)
-        logits = logits.reshape(len(seqs), -1, logits.size(-1))
-        probs = torch.softmax(logits, dim=-1)
-
-        target_probs = probs[:, :self.num_speculative_tokens, :]
-
-        temps = temps.unsqueeze(-1)
-        greedy_mask = (temps == 0.0)
+        logits = logits.reshape(len(seqs), -1, logits.size(-1))  # (B, K + 1, V)
+        scaled = logits / safe_temps.unsqueeze(-1).unsqueeze(-1)
+        probs = torch.softmax(scaled, dim=-1)
+        target_probs = probs[:, :self.num_speculative_tokens, :]  # (B, K, V)
 
         # verify draft tokens
-        indices = draft_tokens.unsqueeze(-1)  # [B, K, 1]
-        draft_token_probs_from_draft = torch.gather(draft_probs, 2, indices).squeeze(-1)
+        indices = draft_tokens.unsqueeze(-1)  # (B, K, 1)
+        draft_token_probs_from_draft = torch.gather(draft_probs, 2, indices).squeeze(-1)  # (B, K)
         draft_token_probs_from_target = torch.gather(target_probs, 2, indices).squeeze(-1)
-        accept_ratio = draft_token_probs_from_target / (draft_token_probs_from_draft + epsilon)
+        accept_ratio = draft_token_probs_from_target / (draft_token_probs_from_draft + EPSILON)
         accept_probs = torch.min(torch.ones_like(accept_ratio), accept_ratio)
         rand_vals = torch.rand_like(accept_probs)
 
-        accepted = (rand_vals < accept_probs)
+        accepted = (rand_vals < accept_probs)  # (B, K)
         if greedy_mask.any():
             target_tokens_greedy = torch.argmax(target_probs, dim=-1)
             accepted_greedy = (draft_tokens == target_tokens_greedy)
-            accepted = torch.where(greedy_mask, accepted_greedy, accepted)
+            accepted = torch.where(greedy_mask.unsqueeze(-1), accepted_greedy, accepted)
 
-        valid_tokens_mask = torch.cumprod(accepted, dim=1).bool()
-        num_accepted = valid_tokens_mask.sum(dim=1)
+        valid_tokens_mask = torch.cumprod(accepted, dim=1).bool()  # (B, K)
+        num_accepted = valid_tokens_mask.sum(dim=1)  # (B,)
 
         # sample next token
-        rejection_case_mask = (num_accepted < self.num_speculative_tokens)
+        rejection_case_mask = (num_accepted < self.num_speculative_tokens)  # (B,)
 
         safe_rejection_indices_vals = torch.clamp(num_accepted, max=self.num_speculative_tokens - 1)
-        rejection_indices = safe_rejection_indices_vals.view(B, 1, 1).expand(-1, -1, self.vocab_size)
-        target_dist_rejection = torch.gather(target_probs, 1, rejection_indices).squeeze(1)
+        rejection_indices = safe_rejection_indices_vals.view(len(seqs), 1, 1).expand(-1, -1, self.vocab_size)  # (B, 1, V)
+        target_dist_rejection = torch.gather(target_probs, 1, rejection_indices).squeeze(1)  # (B, V)
         draft_dist_rejection = torch.gather(draft_probs, 1, rejection_indices).squeeze(1)
 
-        adjusted_probs = torch.clamp(target_dist_rejection - draft_dist_rejection, min=0)
-
-        all_accepted_probs = probs[:, -1, :]
-
-        combined_probs = torch.where(rejection_case_mask.unsqueeze(-1), adjusted_probs, all_accepted_probs)
+        adjusted_probs = torch.clamp(target_dist_rejection - draft_dist_rejection, min=0)  # (B, V)
+        last_probs = probs[:, -1, :]
+        combined_probs = torch.where(rejection_case_mask.unsqueeze(-1), adjusted_probs, last_probs)
 
         norm_sum = combined_probs.sum(dim=-1, keepdim=True)
-        final_next_probs = combined_probs / torch.clamp(norm_sum, min=epsilon)
+        final_next_probs = combined_probs / torch.clamp(norm_sum, min=EPSILON)
 
         final_token_ids = torch.multinomial(final_next_probs, num_samples=1).squeeze(-1)
         if greedy_mask.any():
             final_token_ids_greedy = torch.argmax(final_next_probs, dim=-1)
-            final_token_ids = torch.where(greedy_mask.squeeze(-1), final_token_ids_greedy, final_token_ids)
+            final_token_ids = torch.where(greedy_mask, final_token_ids_greedy, final_token_ids)
 
         for i, seq in enumerate(seqs):
             accepted_count = num_accepted[i].item()
