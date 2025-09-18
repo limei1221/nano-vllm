@@ -14,7 +14,13 @@ class Scheduler:
         self.enable_chunked_prefill = config.enable_chunked_prefill
         self.speculative_decoding = config.speculative_model is not None and config.num_speculative_tokens > 0
         self.num_speculative_tokens = config.num_speculative_tokens
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size, num_draft_blocks=config.num_draft_kvcache_block, speculative_decoding=self.speculative_decoding, num_speculative_tokens=self.num_speculative_tokens)
+        self.block_manager = BlockManager(
+            config.num_kvcache_blocks,
+            config.kvcache_block_size,
+            num_draft_blocks=config.num_draft_kvcache_blocks,
+            speculative_decoding=self.speculative_decoding,
+            num_speculative_tokens=self.num_speculative_tokens
+        )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -134,8 +140,8 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
-        def reach_end(seq: Sequence, token_id: int):
-            return (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens
+        def reach_end(seq: Sequence):
+            return (not seq.ignore_eos and seq.last_token == self.eos) or seq.num_completion_tokens == seq.max_tokens
 
         for seq, token_id in zip(seqs, token_ids):
             if seq.is_speculative:  # Speculative decoding
@@ -147,9 +153,9 @@ class Scheduler:
                             end_index = i
                             break
                     if end_index != -1:
-                        tokens_to_pop = self.num_speculative_tokens - (end_index + 1)
-                        if tokens_to_pop > 0:
-                            seq.pop_last_n_tokens(tokens_to_pop)
+                        to_pop = self.num_speculative_tokens - (end_index + 1)
+                        if to_pop > 0:
+                            seq.pop_last_n_tokens(to_pop)
                         seq.pending_accepted_tokens.clear()
                         seq.status = SequenceStatus.FINISHED
                         self.block_manager.deallocate(seq)
@@ -168,13 +174,13 @@ class Scheduler:
 
                 # append next token
                 seq.append_token(token_id)
-                if reach_end(seq, token_id):
+                if reach_end(seq):
                     seq.status = SequenceStatus.FINISHED
                     self.block_manager.deallocate(seq)
                     if seq in self.running:
                         self.running.remove(seq)
-                seq.is_speculative = False
-            elif seq.num_tokens_to_process is not None:  # Prefill phase
+                # seq.is_speculative = False
+            elif seq.num_tokens_to_process is not None:  # Prefill
                 seq.num_processed_tokens += seq.num_tokens_to_process
                 seq.num_tokens_to_process = None  # Reset for next iteration
                 if seq.num_processed_tokens >= seq.num_prompt_tokens:  # Move to decode phase
@@ -185,7 +191,7 @@ class Scheduler:
                         self.running.append(seq)
 
                     seq.append_token(token_id)
-                    if reach_end(seq, token_id):
+                    if reach_end(seq):
                         seq.status = SequenceStatus.FINISHED
                         self.block_manager.deallocate(seq)
                         self.running.remove(seq)
@@ -195,10 +201,9 @@ class Scheduler:
                         self.running.remove(seq)
                     if seq not in self.waiting:
                         self.waiting.append(seq)
-            else:
-                # Decode phase
+            else:  # Naive decoding
                 seq.append_token(token_id)
-                if reach_end(seq, token_id):
+                if reach_end(seq):
                     seq.status = SequenceStatus.FINISHED
                     self.block_manager.deallocate(seq)
                     self.running.remove(seq)

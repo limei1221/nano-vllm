@@ -167,30 +167,29 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
-        config.num_draft_kvcache_block = 0
+        config.num_draft_kvcache_blocks = 0
         self.draft_kv_cache = None
         # Speculative model KV cache, if present
         if self.speculative_decoding and spec_budget > 0:
             s_num_kv_heads = sconf.num_key_value_heads // self.world_size
             s_block_bytes = 2 * sconf.num_hidden_layers * self.block_size * s_num_kv_heads * sconf.head_dim * sconf.torch_dtype.itemsize
-            config.num_draft_kvcache_block = spec_budget // s_block_bytes
-            assert config.num_draft_kvcache_block > 0
-            if config.num_draft_kvcache_block > 0:
-                self.draft_kv_cache = torch.zeros(
-                    2,
-                    sconf.num_hidden_layers,
-                    config.num_draft_kvcache_block,
-                    self.block_size,
-                    s_num_kv_heads,
-                    sconf.head_dim,
-                    dtype=sconf.torch_dtype,
-                )
-                layer_id = 0
-                for module in self.speculative_model.modules():
-                    if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                        module.k_cache = self.draft_kv_cache[0, layer_id]
-                        module.v_cache = self.draft_kv_cache[1, layer_id]
-                        layer_id += 1
+            config.num_draft_kvcache_blocks = spec_budget // s_block_bytes
+            assert config.num_draft_kvcache_blocks > 0
+            self.draft_kv_cache = torch.zeros(
+                2,
+                sconf.num_hidden_layers,
+                config.num_draft_kvcache_blocks,
+                self.block_size,
+                s_num_kv_heads,
+                sconf.head_dim,
+                dtype=sconf.torch_dtype,
+            )
+            layer_id = 0
+            for module in self.speculative_model.modules():
+                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                    module.k_cache = self.draft_kv_cache[0, layer_id]
+                    module.v_cache = self.draft_kv_cache[1, layer_id]
+                    layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -411,8 +410,9 @@ class ModelRunner:
         draft_tokens = torch.empty((len(seqs), self.num_speculative_tokens), dtype=torch.int64, device=device)
         draft_probs = torch.empty((len(seqs), self.num_speculative_tokens, self.vocab_size), dtype=dtype, device=device)
 
+        is_prefill = any(seq.draft_num_tokens_to_process > 1 for seq in seqs)
         for t in range(self.num_speculative_tokens):
-            if t == 0:
+            if t == 0 and is_prefill:
                 input_ids, positions = self.prepare_prefill(seqs)
                 last_logits = self.run_speculative_model(input_ids, positions, True)
             else:

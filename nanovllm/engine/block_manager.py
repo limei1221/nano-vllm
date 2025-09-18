@@ -200,7 +200,7 @@ class BlockManager:
                 block_table.append(block_id)
             elif len(seq) % self.block_size == 0:  # the last block gets finalized with a hash
                 assert last_block.hash == -1
-                token_ids = seq.block(seq.num_blocks-1)
+                token_ids = seq.block(seq.num_blocks - 1)
                 prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
                 h = self.compute_hash(token_ids, prefix)
                 last_block.update(h, token_ids)
