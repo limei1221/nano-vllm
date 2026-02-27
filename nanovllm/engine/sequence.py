@@ -27,6 +27,8 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.draft_block_table: list[int] = []
+        self.draft_kv_len: int = 0
 
     def __len__(self):
         return self.num_tokens
@@ -70,6 +72,13 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+
+    def pop_last_n_tokens(self, n: int):
+        if n <= 0:
+            return
+        del self.token_ids[-n:]
+        self.num_tokens -= n
+        self.last_token = self.token_ids[-1]
 
     def __getstate__(self):
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,

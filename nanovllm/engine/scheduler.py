@@ -11,7 +11,11 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.block_manager = BlockManager(
+            config.num_kvcache_blocks, config.kvcache_block_size,
+            num_draft_blocks=config.num_draft_kvcache_blocks,
+            num_speculative_tokens=config.num_speculative_tokens,
+        )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -62,10 +66,39 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int] | list[list[int]]):
+        if not token_ids:
+            return
+        if isinstance(token_ids[0], list):
+            self._postprocess_speculative(seqs, token_ids)
+        else:
+            self._postprocess_normal(seqs, token_ids)
+
+    def _postprocess_normal(self, seqs: list[Sequence], token_ids: list[int]):
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
+
+    def _postprocess_speculative(self, seqs: list[Sequence], token_id_lists: list[list[int]]):
+        for seq, new_tokens in zip(seqs, token_id_lists):
+            # Tokens already appended by ModelRunner. Find earliest stop point.
+            n = len(new_tokens)
+            base = seq.num_completion_tokens - n
+            keep = n
+            for j in range(n):
+                is_eos = not seq.ignore_eos and new_tokens[j] == self.eos
+                at_max = base + j + 1 >= seq.max_tokens
+                if is_eos or at_max:
+                    keep = j + 1
+                    break
+            trim = n - keep
+            if trim > 0:
+                seq.pop_last_n_tokens(trim)
+                seq.draft_kv_len = min(seq.draft_kv_len, len(seq))
+            if (not seq.ignore_eos and seq.last_token == self.eos) or seq.num_completion_tokens >= seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
